@@ -1,0 +1,48 @@
+{
+  "id": "osrg-gobgp-0b31b7d4-f832-409c-8928-dddc1470ecb6",
+  "expectedSyncRevision": 4,
+  "completionStatus": "部分完成",
+  "rubricResults": [
+    {
+      "id": 1,
+      "passed": true,
+      "reason": ""
+    },
+    {
+      "id": 2,
+      "passed": true,
+      "reason": ""
+    },
+    {
+      "id": 3,
+      "passed": true,
+      "reason": ""
+    },
+    {
+      "id": 4,
+      "passed": false,
+      "reason": "RIB 重放中 SendIPRoute 错误只记录日志，prepareSession 仍把 FIB 类别标记为已同步"
+    },
+    {
+      "id": 5,
+      "passed": false,
+      "reason": "nexthop 重放中 SendNexthopRegister 错误只记录日志，prepareSession 仍把 nexthop 类别标记为已同步"
+    },
+    {
+      "id": 6,
+      "passed": false,
+      "reason": "初始 MPLS label chunk 请求失败后只记录错误，当前已连接会话不会重试且一直保持未同步"
+    },
+    {
+      "id": 7,
+      "passed": true,
+      "reason": ""
+    },
+    {
+      "id": 8,
+      "passed": true,
+      "reason": ""
+    }
+  ],
+  "runResult": "1 通过\n2 通过\n3 通过\n4 未通过 RIB 重放中 SendIPRoute 错误只记录日志，prepareSession 仍把 FIB 类别标记为已同步\n5 未通过 nexthop 重放中 SendNexthopRegister 错误只记录日志，prepareSession 仍把 nexthop 类别标记为已同步\n6 未通过 初始 MPLS label chunk 请求失败后只记录错误，当前已连接会话不会重试且一直保持未同步\n7 通过\n8 通过"
+}

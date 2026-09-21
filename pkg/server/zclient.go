@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"strconv"
@@ -144,10 +145,10 @@ func filterOutExternalPath(paths []*table.Path) []*table.Path {
 	return filteredPaths
 }
 
-func addLabelToNexthop(path *table.Path, z *zebraClient, msgFlags *zebra.MessageFlag, nexthop *zebra.Nexthop) {
+func addLabelToNexthop(path *table.Path, cli *zebra.Client, msgFlags *zebra.MessageFlag, nexthop *zebra.Nexthop) {
 	rf := path.GetFamily()
 	if rf == bgp.RF_IPv4_VPN || rf == bgp.RF_IPv6_VPN {
-		z.client.SetLabelFlag(msgFlags, nexthop)
+		cli.SetLabelFlag(msgFlags, nexthop)
 		switch rf {
 		case bgp.RF_IPv4_VPN:
 			for _, label := range path.GetNlri().(*bgp.LabeledVPNIPAddrPrefix).Labels.Labels {
@@ -163,8 +164,8 @@ func addLabelToNexthop(path *table.Path, z *zebraClient, msgFlags *zebra.Message
 	}
 }
 
-func newIPRouteBody(dst []*table.Path, vrfID uint32, z *zebraClient) (body *zebra.IPRouteBody, isWithdraw bool) {
-	version := z.client.Version
+func newIPRouteBody(dst []*table.Path, vrfID uint32, z *zebraClient, cli *zebra.Client) (body *zebra.IPRouteBody, isWithdraw bool) {
+	version := cli.Version
 	paths := filterOutExternalPath(dst)
 	if len(paths) == 0 {
 		return nil, false
@@ -212,18 +213,18 @@ func newIPRouteBody(dst []*table.Path, vrfID uint32, z *zebraClient) (body *zebr
 			}
 		}
 		if nhVrfID != vrfID {
-			addLabelToNexthop(path, z, &msgFlags, &nexthop)
+			addLabelToNexthop(path, cli, &msgFlags, &nexthop)
 		}
 		nexthops = append(nexthops, nexthop)
 	}
 	plen, _ := strconv.ParseUint(l[1], 10, 8)
 	med, err := path.GetMed()
 	if err == nil {
-		msgFlags |= zebra.MessageMetric.ToEach(version, z.client.Software)
+		msgFlags |= zebra.MessageMetric.ToEach(version, cli.Software)
 	}
 	var flags zebra.Flag
 	if path.IsIBGP() {
-		flags = zebra.FlagIBGP.ToEach(z.client.Version, z.client.Software) | zebra.FlagAllowRecursion
+		flags = zebra.FlagIBGP.ToEach(cli.Version, cli.Software) | zebra.FlagAllowRecursion
 	} else if path.GetSource().MultihopTtl > 0 {
 		flags = zebra.FlagAllowRecursion // 0x01
 	}
@@ -353,15 +354,101 @@ type mplsLabelParameter struct {
 	unassignedVrf []*table.Vrf // Vrfs which are not assigned MPLS label
 }
 
+// zebraSyncCategory identifies a class of state that must be (re)synchronized
+// with Zebra after a new session is established. A session must never be
+// reported as healthy as long as a required category is missing.
+type zebraSyncCategory uint8
+
+const (
+	zebraSyncFIBRoutes zebraSyncCategory = 1 << iota
+	zebraSyncNexthopRegs
+	zebraSyncMplsLabels
+)
+
+func (c zebraSyncCategory) String() string {
+	categories := make([]string, 0, 3)
+	if c&zebraSyncFIBRoutes != 0 {
+		categories = append(categories, "fib-routes")
+	}
+	if c&zebraSyncNexthopRegs != 0 {
+		categories = append(categories, "nexthop-registrations")
+	}
+	if c&zebraSyncMplsLabels != 0 {
+		categories = append(categories, "mpls-labels")
+	}
+	return strings.Join(categories, ",")
+}
+
+// Reconnection backoff parameters. The delay grows exponentially up to the
+// maximum and gets a random jitter so that gobgpd does not hammer a restarting
+// Zebra in lockstep. Every wait is select-ed against the lifecycle context,
+// making it cancelable at any time.
+const (
+	zebraDialInitialBackoff       = time.Second
+	zebraDialMaxBackoff           = 60 * time.Second
+	zebraHealthySessionThreshold  = 30 * time.Second
+	zebraBackoffJitterDenominator = 4 // up to 25% jitter
+)
+
+func nextDialBackoff(current time.Duration) time.Duration {
+	if current < zebraDialInitialBackoff {
+		// First failure: start with the initial delay rather than doubling it.
+		return zebraDialInitialBackoff
+	}
+	next := current * 2
+	if next > zebraDialMaxBackoff {
+		next = zebraDialMaxBackoff
+	}
+	return next
+}
+
+func jitterBackoff(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	jitterRange := int64(d / zebraBackoffJitterDenominator)
+	if jitterRange <= 0 {
+		return d
+	}
+	return d + time.Duration(rand.Int64N(jitterRange))
+}
+
 type zebraClient struct {
-	client       *zebra.Client
-	server       *BgpServer
+	server *BgpServer
+
+	// Immutable configuration for the lifetime of the integration.
+	url                string
+	protos             []string
+	preferredVersion   uint8
+	zapiVersions       []uint8 // ZAPI versions in fallback order
+	software           zebra.Software
+	nhtEnable          bool
+	nhtDelay           uint8
+	mplsLabelRangeSize uint32
+
+	// Session lifecycle. ctx cancellation stops dialing, backoff waits and
+	// replays immediately; done is closed when the loop goroutine exits.
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	// client is the transport of the currently established session. It is nil
+	// while disconnected or reconnecting. All goroutines other than the loop
+	// must access it through activeClient().
+	sessionMu sync.RWMutex
+	client    *zebra.Client
+
 	nexthopCache nexthopStateCache
 	cacheLock    sync.Mutex
 	pathVrfMap   map[*table.Path]uint32 // vpn paths and nexthop vpn id
 	pathVrfMu    sync.RWMutex
 	mplsLabel    mplsLabelParameter
-	dead         chan struct{}
+
+	// required/synced describe the synchronization state of the current
+	// session and are reset on every (re)connect.
+	syncMu   sync.Mutex
+	required zebraSyncCategory
+	synced   zebraSyncCategory
 }
 
 func (z *zebraClient) getPathListWithNexthopUpdate(body *zebra.NexthopUpdateBody) []*table.Path {
@@ -407,7 +494,548 @@ func (z *zebraClient) updatePathByNexthopCache(paths []*table.Path) {
 	}
 }
 
+// activeClient returns the transport of the current session, or nil while
+// disconnected or reconnecting.
+func (z *zebraClient) activeClient() *zebra.Client {
+	z.sessionMu.RLock()
+	defer z.sessionMu.RUnlock()
+	return z.client
+}
+
+func (z *zebraClient) setSessionClient(cli *zebra.Client) {
+	z.sessionMu.Lock()
+	z.client = cli
+	z.sessionMu.Unlock()
+}
+
+func (z *zebraClient) clearSessionClient(cli *zebra.Client) {
+	z.sessionMu.Lock()
+	if z.client == cli {
+		z.client = nil
+	}
+	z.sessionMu.Unlock()
+}
+
+// stop permanently terminates the Zebra integration: it cancels any in-flight
+// dial, backoff wait and replay and closes the active session. The loop never
+// reconnects afterwards.
+func (z *zebraClient) stop() {
+	z.cancel()
+	if cli := z.activeClient(); cli != nil {
+		cli.Close()
+	}
+}
+
+func (z *zebraClient) wait() {
+	<-z.done
+}
+
+func (z *zebraClient) resetSyncState(required zebraSyncCategory) {
+	z.syncMu.Lock()
+	z.required = required
+	z.synced = 0
+	z.syncMu.Unlock()
+}
+
+func (z *zebraClient) markSynced(categories zebraSyncCategory) {
+	z.syncMu.Lock()
+	wasHealthy := z.synced&z.required == z.required
+	z.synced |= categories
+	healthy := z.synced&z.required == z.required
+	missing := z.required &^ z.synced
+	z.syncMu.Unlock()
+	if !wasHealthy && healthy {
+		z.server.logger.Info("success to synchronize with Zebra",
+			slog.String("Topic", "Zebra"))
+	} else if missing != 0 {
+		z.server.logger.Debug("Zebra synchronization pending",
+			slog.String("Topic", "Zebra"),
+			slog.String("Pending", missing.String()))
+	}
+}
+
+func (z *zebraClient) isHealthy() bool {
+	z.sessionMu.RLock()
+	connected := z.client != nil
+	z.sessionMu.RUnlock()
+	z.syncMu.Lock()
+	defer z.syncMu.Unlock()
+	return connected && z.synced&z.required == z.required
+}
+
+// waitBackoff sleeps for the given (jittered) backoff. It returns false when
+// the integration is stopped during the wait.
+func (z *zebraClient) waitBackoff(d time.Duration) bool {
+	timer := time.NewTimer(jitterBackoff(d))
+	defer timer.Stop()
+	select {
+	case <-z.ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// dialSession performs one connection round: it tries every configured ZAPI
+// version, preserving the negotiated-version fallback order, and returns the
+// first client that completes the initial protocol exchange.
+func (z *zebraClient) dialSession() (*zebra.Client, error) {
+	if err := z.ctx.Err(); err != nil {
+		return nil, err
+	}
+	l := strings.SplitN(z.url, ":", 2)
+	var lastErr error
+	for elem, ver := range z.zapiVersions {
+		if err := z.ctx.Err(); err != nil {
+			return nil, err
+		}
+		cli, err := zebra.NewClientWithContext(z.ctx, z.server.logger, l[0], l[1], zebra.RouteBGP, ver, z.software, z.mplsLabelRangeSize)
+		if err == nil && cli != nil {
+			z.server.logger.Info("success to connect to Zebra",
+				slog.String("Topic", "Zebra"),
+				slog.Int("Version", int(ver)))
+			return cli, nil
+		}
+		lastErr = err
+		// Retry with another Zebra message version
+		z.server.logger.Warn("cannot connect to Zebra with message version",
+			slog.String("Topic", "Zebra"),
+			slog.Int("Version", int(ver)),
+			slog.String("Error", errString(err)))
+		if elem < len(z.zapiVersions)-1 {
+			z.server.logger.Warn("going to retry another version",
+				slog.String("Topic", "Zebra"),
+				slog.Int("Version", int(z.zapiVersions[elem+1])))
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("failed to connect to Zebra")
+	}
+	return nil, lastErr
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// drainIncoming non-blockingly processes messages already delivered by the
+// current session. Processing Zebra messages while a large replay is in
+// progress prevents the bounded incoming channel from filling up and stalling
+// Zebra. It returns false when the session is gone or the client is stopping.
+func (z *zebraClient) drainIncoming(cli *zebra.Client) bool {
+	for {
+		select {
+		case <-z.ctx.Done():
+			return false
+		case msg, ok := <-cli.Receive():
+			if !ok {
+				return false
+			}
+			z.handleZebraMessage(cli, msg)
+		default:
+			return true
+		}
+	}
+}
+
+// withdrawStaleExternalRoutes removes routes that the previous (dead) Zebra
+// session had redistributed into the GoBGP RIB. Zebra lost the corresponding
+// state when its zserv connection went away, so keeping them would leave stale
+// half-state that never gets refreshed.
+func (z *zebraClient) withdrawStaleExternalRoutes() {
+	paths := z.server.globalRib.GetBestPathList(table.GLOBAL_RIB_NAME, 0,
+		[]bgp.Family{bgp.RF_IPv4_UC, bgp.RF_IPv6_UC})
+	withdrawals := make([]*table.Path, 0, len(paths))
+	for _, p := range paths {
+		if p.IsFromExternal() {
+			withdrawals = append(withdrawals, p.Clone(true))
+		}
+	}
+	if len(withdrawals) == 0 {
+		return
+	}
+	if err := z.server.addPathStream("", withdrawals); err != nil {
+		z.server.logger.Error("failed to withdraw stale routes from previous Zebra session",
+			slog.String("Topic", "Zebra"),
+			slog.Int("NumRoutes", len(withdrawals)),
+			slog.String("Error", err.Error()))
+	}
+}
+
+func (z *zebraClient) resetNexthopCache() {
+	z.cacheLock.Lock()
+	z.nexthopCache = make(nexthopStateCache)
+	z.cacheLock.Unlock()
+}
+
+// replayMplsLabels invalidates label chunks of the previous Zebra process,
+// queues every existing VRF for label reassignment and requests a fresh label
+// chunk. The GET_LABEL_CHUNK response arrives asynchronously and completes the
+// mpls-labels synchronization category.
+func (z *zebraClient) replayMplsLabels(cli *zebra.Client) {
+	if z.mplsLabelRangeSize == 0 || !cli.SupportMpls() {
+		return
+	}
+	z.mplsLabel.maps = make(map[uint64]*table.Bitmap)
+	queued := make([]*table.Vrf, 0)
+	for _, vrf := range z.server.globalRib.GetAllVrfsMap() {
+		// Labels assigned by the previous Zebra process belong to its label
+		// chunk and must be reallocated from the new chunk.
+		vrf.MplsLabel = 0
+		queued = append(queued, vrf)
+	}
+	z.mplsLabel.unassignedVrf = queued
+	if err := cli.SendGetLabelChunk(&zebra.GetLabelChunkBody{ChunkSize: z.mplsLabelRangeSize}); err != nil {
+		z.server.logger.Error("failed to request MPLS label chunk from new Zebra session",
+			slog.String("Topic", "Zebra"),
+			slog.String("Error", err.Error()))
+	}
+}
+
+// sendBestPathsToZebra installs one best-path (multi-path) group into every
+// target VRF and (re)registers its nexthops. It returns false when the
+// session broke while sending.
+func (z *zebraClient) sendBestPathsToZebra(cli *zebra.Client, paths []*table.Path, vrfs map[uint32]bool) bool {
+	for vrfID := range vrfs {
+		if body, isWithdraw := newIPRouteBody(paths, vrfID, z, cli); body != nil {
+			if err := cli.SendIPRoute(vrfID, body, isWithdraw); err != nil {
+				z.server.logger.Error("failed to send ip route",
+					slog.String("Topic", "Zebra"),
+					slog.String("Error", err.Error()),
+				)
+			}
+		}
+		z.cacheLock.Lock()
+		body := newNexthopRegisterBody(paths, z.nexthopCache)
+		z.cacheLock.Unlock()
+		if body != nil {
+			if err := cli.SendNexthopRegister(vrfID, body, false); err != nil {
+				z.server.logger.Error("failed to send nexthop register",
+					slog.String("Topic", "Zebra"),
+					slog.String("Error", err.Error()),
+				)
+			}
+		}
+		if !z.drainIncoming(cli) {
+			return false
+		}
+	}
+	return true
+}
+
+// replayRoutesAndNexthops rebuilds the FIB and nexthop registrations of the
+// new session from the current GoBGP best-path RIB. Returns false when the
+// session is gone; per-route validation errors are logged but do not abort the
+// rest of the replay, matching the normal best-path event handling.
+func (z *zebraClient) replayRoutesAndNexthops(cli *zebra.Client) bool {
+	rib := z.server.globalRib
+	if rib.UseMultiplePathsEnabled() {
+		groups := rib.GetBestMultiPathList(table.GLOBAL_RIB_NAME, nil)
+		vrfs := make(map[uint32]bool)
+		for _, paths := range groups {
+			z.server.setPathVrfIdMap(paths, vrfs)
+		}
+		if len(vrfs) == 0 {
+			return z.drainIncoming(cli)
+		}
+		for _, paths := range groups {
+			if !z.sendBestPathsToZebra(cli, paths, vrfs) {
+				return false
+			}
+		}
+		return true
+	}
+
+	paths := rib.GetBestPathList(table.GLOBAL_RIB_NAME, 0, nil)
+	vrfs := make(map[uint32]bool)
+	z.server.setPathVrfIdMap(paths, vrfs)
+	if len(vrfs) == 0 {
+		return z.drainIncoming(cli)
+	}
+	for _, path := range paths {
+		if !z.sendBestPathsToZebra(cli, []*table.Path{path}, vrfs) {
+			return false
+		}
+	}
+	return true
+}
+
+// drainWatcherEvents drops RIB change events that predate the resync snapshot;
+// replay reads the current RIB instead, so those events are obsolete.
+func drainWatcherEvents(w *watcher) {
+	for {
+		select {
+		case <-w.ch.Out():
+		case <-w.realCh:
+		default:
+			return
+		}
+	}
+}
+
+// prepareSession rebuilds every piece of session-owned state after a new
+// transport session is established. It returns false when the integration is
+// stopped before preparation completes.
+func (z *zebraClient) prepareSession(cli *zebra.Client, w *watcher) bool {
+	// Note: HELLO/ROUTER_ID_ADD messages are automatically sent to negotiate
+	// the Zebra message version in zebra.NewClientWithContext().
+	cli.SendInterfaceAdd()
+	if !z.drainIncoming(cli) {
+		return false
+	}
+
+	// Purge state owned by the previous session BEFORE subscribing to
+	// redistributed routes again. Zebra only starts dumping its routes after
+	// REDISTRIBUTE_ADD, so a fresh route can never be mistaken for stale
+	// state of the old session.
+	z.withdrawStaleExternalRoutes()
+	z.resetNexthopCache()
+	if z.ctx.Err() != nil {
+		return false
+	}
+
+	// All RIB changes observed so far predate the resync snapshot below.
+	drainWatcherEvents(w)
+
+	for _, typ := range z.protos {
+		t, err := zebra.RouteTypeFromString(typ, z.preferredVersion, z.software)
+		if err != nil {
+			z.server.logger.Error("failed to subscribe redistributed route type",
+				slog.String("Topic", "Zebra"),
+				slog.String("RouteType", typ),
+				slog.String("Error", err.Error()))
+			continue
+		}
+		cli.SendRedistribute(t, zebra.DefaultVrf)
+	}
+	if !z.drainIncoming(cli) {
+		return false
+	}
+
+	required := zebraSyncFIBRoutes | zebraSyncNexthopRegs
+	if z.mplsLabelRangeSize > 0 && cli.SupportMpls() {
+		required |= zebraSyncMplsLabels
+	}
+	z.resetSyncState(required)
+
+	z.replayMplsLabels(cli)
+	if !z.drainIncoming(cli) {
+		return false
+	}
+
+	if !z.replayRoutesAndNexthops(cli) {
+		return false
+	}
+	z.markSynced(zebraSyncFIBRoutes | zebraSyncNexthopRegs)
+
+	if z.ctx.Err() != nil {
+		return false
+	}
+
+	z.syncMu.Lock()
+	missing := z.required &^ z.synced
+	z.syncMu.Unlock()
+	if missing != 0 {
+		// The session is usable for normal updates, but some state is still
+		// pending (e.g. the MPLS label chunk response); do not call it
+		// healthy. It will be retried when the chunk arrives or on the next
+		// reconnect.
+		z.server.logger.Warn("Zebra session is up but not fully synchronized",
+			slog.String("Topic", "Zebra"),
+			slog.String("Pending", missing.String()))
+	}
+	return true
+}
+
+// serveSession runs the normal send/recv loop for an established session. It
+// returns true when the stop is intentional (integration disabled or BGP
+// stopped) and false when the connection was lost and a reconnect is needed.
+func (z *zebraClient) serveSession(cli *zebra.Client, w *watcher) bool {
+	incoming := cli.Receive()
+	events := w.Event()
+	for {
+		select {
+		case <-z.ctx.Done():
+			return true
+		case msg, ok := <-incoming:
+			// A closed channel means the Zebra connection was lost. Using the
+			// two-value receive (instead of spinning on a nil message) avoids
+			// a busy loop over the closed channel.
+			if !ok {
+				return false
+			}
+			z.handleZebraMessage(cli, msg)
+		case ev, ok := <-events:
+			if !ok {
+				return true
+			}
+			z.handleWatchEvent(cli, ev)
+		}
+	}
+}
+
+func (z *zebraClient) handleZebraMessage(cli *zebra.Client, msg *zebra.Message) {
+	switch body := msg.Body.(type) {
+	case *zebra.IPRouteBody:
+		if path := newPathFromIPRouteMessage(z.server.logger, msg, cli.Version, cli.Software); path != nil {
+			if err := z.server.addPathStream("", []*table.Path{path}); err != nil {
+				z.server.logger.Error("failed to add path from zebra",
+					slog.String("Topic", "Zebra"),
+					slog.Any("Path", path),
+					slog.String("Error", err.Error()),
+				)
+			}
+		}
+	case *zebra.NexthopUpdateBody:
+		z.cacheLock.Lock()
+		updated := z.nexthopCache.updateByNexthopUpdate(body)
+		z.cacheLock.Unlock()
+		if !updated {
+			return
+		}
+		paths := z.getPathListWithNexthopUpdate(body)
+		if len(paths) == 0 {
+			// If there is no path bound for the given nexthop, send
+			// NEXTHOP_UNREGISTER message.
+			z.cacheLock.Lock()
+			delete(z.nexthopCache, body.Prefix.Prefix)
+			z.cacheLock.Unlock()
+			if err := cli.SendNexthopRegister(msg.Header.VrfID, newNexthopUnregisterBody(uint16(body.Prefix.Family), body.Prefix.Prefix), true); err != nil {
+				z.server.logger.Error("failed to send nexthop unregister",
+					slog.String("Topic", "Zebra"),
+					slog.String("Error", err.Error()),
+				)
+			}
+			return
+		}
+		z.updatePathByNexthopCache(paths)
+	case *zebra.GetLabelChunkBody:
+		z.server.logger.Debug("zebra GetLabelChunkBody is received",
+			slog.String("Topic", "Zebra"),
+			slog.Int("Start", int(body.Start)),
+			slog.Int("End", int(body.End)),
+		)
+		startEnd := uint64(body.Start)<<32 | uint64(body.End)
+		z.mplsLabel.maps[startEnd] = table.NewBitmap(int(body.End - body.Start + 1))
+		failed := false
+		for _, vrf := range z.mplsLabel.unassignedVrf {
+			if err := z.assignAndSendVrfMplsLabel(vrf); err != nil {
+				failed = true
+				z.server.logger.Error("zebra failed to assign and send vrf mpls label",
+					slog.String("Topic", "Zebra"),
+					slog.String("Vrf", vrf.Name),
+					slog.String("Error", err.Error()))
+			}
+		}
+		z.mplsLabel.unassignedVrf = nil
+		z.syncMu.Lock()
+		mplsRequired := z.required&zebraSyncMplsLabels != 0
+		z.syncMu.Unlock()
+		if mplsRequired {
+			if failed {
+				// Keep the category unsynced so the session is not reported
+				// healthy; the next reconnect retries the whole replay.
+				z.server.logger.Warn("MPLS label synchronization incomplete; will retry on reconnect",
+					slog.String("Topic", "Zebra"))
+			} else {
+				z.markSynced(zebraSyncMplsLabels)
+			}
+		}
+	}
+}
+
+func (z *zebraClient) handleWatchEvent(cli *zebra.Client, ev watchEvent) {
+	switch msg := ev.(type) {
+	case *watchEventBestPath:
+		if z.server.globalRib.UseMultiplePathsEnabled() {
+			for _, paths := range msg.MultiPathList {
+				z.updatePathByNexthopCache(paths)
+				for i := range msg.Vrf {
+					if body, isWithdraw := newIPRouteBody(paths, i, z, cli); body != nil {
+						if err := cli.SendIPRoute(i, body, isWithdraw); err != nil {
+							z.server.logger.Error("failed to send ip route",
+								slog.String("Topic", "Zebra"),
+								slog.String("Error", err.Error()),
+							)
+							continue
+						}
+					}
+					z.cacheLock.Lock()
+					body := newNexthopRegisterBody(paths, z.nexthopCache)
+					z.cacheLock.Unlock()
+					if body != nil {
+						if err := cli.SendNexthopRegister(i, body, false); err != nil {
+							z.server.logger.Error("failed to send nexthop register",
+								slog.String("Topic", "Zebra"),
+								slog.String("Error", err.Error()),
+							)
+							continue
+						}
+					}
+				}
+			}
+		} else {
+			z.updatePathByNexthopCache(msg.PathList)
+			for _, path := range msg.PathList {
+				for i := range msg.Vrf {
+					if body, isWithdraw := newIPRouteBody([]*table.Path{path}, i, z, cli); body != nil {
+						if err := cli.SendIPRoute(i, body, isWithdraw); err != nil {
+							z.server.logger.Error("failed to send ip route",
+								slog.String("Topic", "Zebra"),
+								slog.String("Error", err.Error()),
+							)
+							continue
+						}
+					}
+					z.cacheLock.Lock()
+					body := newNexthopRegisterBody([]*table.Path{path}, z.nexthopCache)
+					z.cacheLock.Unlock()
+					if body != nil {
+						if err := cli.SendNexthopRegister(i, body, false); err != nil {
+							z.server.logger.Error("failed to send nexthop register",
+								slog.String("Topic", "Zebra"),
+								slog.String("Error", err.Error()),
+							)
+							continue
+						}
+					}
+				}
+			}
+		}
+	case *watchEventUpdate:
+		z.cacheLock.Lock()
+		body := newNexthopRegisterBody(msg.PathList, z.nexthopCache)
+		z.cacheLock.Unlock()
+		if body != nil {
+			vrfID := uint32(0)
+			if err := z.server.ListVrf(context.Background(), &api.ListVrfRequest{Name: msg.Neighbor.Config.Vrf}, func(v *api.Vrf) {
+				vrfID = v.Id
+			}); err != nil {
+				z.server.logger.Error("failed to get vrf id",
+					slog.String("Topic", "Zebra"),
+					slog.String("Error", err.Error()),
+				)
+			}
+			if err := cli.SendNexthopRegister(vrfID, body, false); err != nil {
+				z.server.logger.Error("failed to send nexthop register",
+					slog.String("Topic", "Zebra"),
+					slog.String("Error", err.Error()),
+				)
+			}
+		}
+	}
+}
+
+// loop owns the entire connection lifecycle: dial with cancelable exponential
+// backoff, (re)negotiate and resubscribe on every session, rebuild session
+// state from the current RIB, run the normal recv/update loop, and reconnect
+// when the connection drops. It only exits when the integration is stopped.
 func (z *zebraClient) loop() {
+	defer close(z.done)
+
 	w, err := z.server.watch([]WatchOption{
 		WatchBestPath(true),
 		WatchPostUpdate(true, "", ""),
@@ -421,154 +1049,58 @@ func (z *zebraClient) loop() {
 	}
 	defer w.Stop()
 
+	backoff := time.Duration(0)
 	for {
-		select {
-		case <-z.dead:
+		if backoff > 0 {
+			z.server.logger.Warn("retrying Zebra connection after backoff",
+				slog.String("Topic", "Zebra"),
+				slog.Duration("Backoff", backoff))
+			if !z.waitBackoff(backoff) {
+				return
+			}
+		}
+
+		cli, err := z.dialSession()
+		if err != nil {
+			if z.ctx.Err() != nil {
+				return
+			}
+			z.server.logger.Warn("failed to establish Zebra session",
+				slog.String("Topic", "Zebra"),
+				slog.String("Error", errString(err)))
+			backoff = nextDialBackoff(backoff)
+			continue
+		}
+
+		sessionStart := time.Now()
+		z.setSessionClient(cli)
+
+		prepared := z.prepareSession(cli, w)
+		if !prepared {
+			// Stopped while establishing or resynchronizing the session.
+			z.clearSessionClient(cli)
+			cli.Close()
 			return
-		case msg := <-z.client.Receive():
-			if msg == nil {
-				break
-			}
-			switch body := msg.Body.(type) {
-			case *zebra.IPRouteBody:
-				if path := newPathFromIPRouteMessage(z.server.logger, msg, z.client.Version, z.client.Software); path != nil {
-					if err := z.server.addPathStream("", []*table.Path{path}); err != nil {
-						z.server.logger.Error("failed to add path from zebra",
-							slog.String("Topic", "Zebra"),
-							slog.Any("Path", path),
-							slog.String("Error", err.Error()),
-						)
-					}
-				}
-			case *zebra.NexthopUpdateBody:
-				z.cacheLock.Lock()
-				updated := z.nexthopCache.updateByNexthopUpdate(body)
-				z.cacheLock.Unlock()
-				if !updated {
-					continue
-				}
-				paths := z.getPathListWithNexthopUpdate(body)
-				if len(paths) == 0 {
-					// If there is no path bound for the given nexthop, send
-					// NEXTHOP_UNREGISTER message.
-					z.cacheLock.Lock()
-					delete(z.nexthopCache, body.Prefix.Prefix)
-					z.cacheLock.Unlock()
-					err := z.client.SendNexthopRegister(msg.Header.VrfID, newNexthopUnregisterBody(uint16(body.Prefix.Family), body.Prefix.Prefix), true)
-					if err != nil {
-						z.server.logger.Error("failed to send nexthop unregister",
-							slog.String("Topic", "Zebra"),
-							slog.String("Error", err.Error()),
-						)
-					}
-					continue
-				}
-				z.updatePathByNexthopCache(paths)
-			case *zebra.GetLabelChunkBody:
-				z.server.logger.Debug("zebra GetLabelChunkBody is received",
-					slog.String("Topic", "Zebra"),
-					slog.Int("Start", int(body.Start)),
-					slog.Int("End", int(body.End)),
-				)
-				startEnd := uint64(body.Start)<<32 | uint64(body.End)
-				z.mplsLabel.maps[startEnd] = table.NewBitmap(int(body.End - body.Start + 1))
-				for _, vrf := range z.mplsLabel.unassignedVrf {
-					if err := z.assignAndSendVrfMplsLabel(vrf); err != nil {
-						z.server.logger.Error("zebra failed to assign and send vrf mpls label",
-							slog.String("Topic", "Zebra"),
-							slog.String("Vrf", vrf.Name),
-							slog.String("Error", err.Error()))
-					}
-				}
-				z.mplsLabel.unassignedVrf = nil
-			}
-		case ev := <-w.Event():
-			switch msg := ev.(type) {
-			case *watchEventBestPath:
-				if z.server.globalRib.UseMultiplePathsEnabled() {
-					for _, paths := range msg.MultiPathList {
-						z.updatePathByNexthopCache(paths)
-						for i := range msg.Vrf {
-							if body, isWithdraw := newIPRouteBody(paths, i, z); body != nil {
-								err := z.client.SendIPRoute(i, body, isWithdraw)
-								if err != nil {
-									z.server.logger.Error("failed to send ip route",
-										slog.String("Topic", "Zebra"),
-										slog.String("Error", err.Error()),
-									)
-									continue
-								}
-							}
-							z.cacheLock.Lock()
-							body := newNexthopRegisterBody(paths, z.nexthopCache)
-							z.cacheLock.Unlock()
-							if body != nil {
-								err := z.client.SendNexthopRegister(i, body, false)
-								if err != nil {
-									z.server.logger.Error("failed to send nexthop register",
-										slog.String("Topic", "Zebra"),
-										slog.String("Error", err.Error()),
-									)
-									continue
-								}
-							}
-						}
-					}
-				} else {
-					z.updatePathByNexthopCache(msg.PathList)
-					for _, path := range msg.PathList {
-						for i := range msg.Vrf {
-							if body, isWithdraw := newIPRouteBody([]*table.Path{path}, i, z); body != nil {
-								err := z.client.SendIPRoute(i, body, isWithdraw)
-								if err != nil {
-									z.server.logger.Error("failed to send ip route",
-										slog.String("Topic", "Zebra"),
-										slog.String("Error", err.Error()),
-									)
-									continue
-								}
-							}
-							z.cacheLock.Lock()
-							body := newNexthopRegisterBody([]*table.Path{path}, z.nexthopCache)
-							z.cacheLock.Unlock()
-							if body != nil {
-								err := z.client.SendNexthopRegister(i, body, false)
-								if err != nil {
-									z.server.logger.Error("failed to send nexthop register",
-										slog.String("Topic", "Zebra"),
-										slog.String("Error", err.Error()),
-									)
-									continue
-								}
-							}
-						}
-					}
-				}
-			case *watchEventUpdate:
-				z.cacheLock.Lock()
-				body := newNexthopRegisterBody(msg.PathList, z.nexthopCache)
-				z.cacheLock.Unlock()
-				if body != nil {
-					vrfID := uint32(0)
-					err := z.server.ListVrf(context.Background(), &api.ListVrfRequest{Name: msg.Neighbor.Config.Vrf}, func(v *api.Vrf) {
-						vrfID = v.Id
-					})
-					if err != nil {
-						z.server.logger.Error("failed to get vrf id",
-							slog.String("Topic", "Zebra"),
-							slog.String("Error", err.Error()),
-						)
-					}
-					err = z.client.SendNexthopRegister(vrfID, body, false)
-					if err != nil {
-						z.server.logger.Error("failed to send nexthop register",
-							slog.String("Topic", "Zebra"),
-							slog.String("Error", err.Error()),
-						)
-						continue
-					}
-				}
-			}
+		}
+
+		intentional := z.serveSession(cli, w)
+
+		z.clearSessionClient(cli)
+		cli.Close()
+		z.resetSyncState(0)
+
+		if intentional || z.ctx.Err() != nil {
+			return
+		}
+		z.server.logger.Warn("connection to Zebra lost",
+			slog.String("Topic", "Zebra"))
+
+		// A session that stayed healthy for a while gets one immediate
+		// reconnect attempt; flapping sessions keep backing off.
+		if time.Since(sessionStart) >= zebraHealthySessionThreshold {
+			backoff = 0
+		} else {
+			backoff = nextDialBackoff(backoff)
 		}
 	}
 }
@@ -578,9 +1110,6 @@ func newZebraClient(s *BgpServer, url string, protos []string, version uint8, nh
 	if len(l) != 2 {
 		return nil, fmt.Errorf("unsupported url: %s", url)
 	}
-	var cli *zebra.Client
-	var err error
-	var usingVersion uint8
 	var zapivers [zebra.MaxZapiVer - zebra.MinZapiVer + 1]uint8
 	zapivers[0] = version
 	for elem, ver := 1, zebra.MinZapiVer; elem < len(zapivers) && ver <= zebra.MaxZapiVer; elem++ {
@@ -590,60 +1119,41 @@ func newZebraClient(s *BgpServer, url string, protos []string, version uint8, nh
 		zapivers[elem] = ver
 		ver++
 	}
-	for elem, ver := range zapivers {
-		cli, err = zebra.NewClient(s.logger, l[0], l[1], zebra.RouteBGP, ver, software, mplsLabelRangeSize)
-		if cli != nil && err == nil {
-			usingVersion = ver
-			break
-		}
-		// Retry with another Zebra message version
-		s.logger.Warn("cannot connect to Zebra with message version",
-			slog.String("Topic", "Zebra"),
-			slog.Int("Version", int(ver)))
-		if elem < len(zapivers)-1 {
-			s.logger.Warn("going to retry another version",
-				slog.String("Topic", "Zebra"),
-				slog.Int("Version", int(zapivers[elem+1])))
-		}
-	}
-	if cli == nil || err != nil {
-		return nil, err
-	}
-	s.logger.Info("success to connect to Zebra",
-		slog.String("Topic", "Zebra"),
-		slog.Int("Version", int(usingVersion)),
-	)
 
-	// Note: HELLO/ROUTER_ID_ADD messages are automatically sent to negotiate
-	// the Zebra message version in zebra.NewClient().
-	// cli.SendHello()
-	// cli.SendRouterIDAdd()
-	cli.SendInterfaceAdd()
-	for _, typ := range protos {
-		t, err := zebra.RouteTypeFromString(typ, version, software)
-		if err != nil {
-			return nil, err
-		}
-		cli.SendRedistribute(t, zebra.DefaultVrf)
-	}
-	w := &zebraClient{
-		client:       cli,
-		server:       s,
-		nexthopCache: make(nexthopStateCache),
-		pathVrfMap:   make(map[*table.Path]uint32),
+	ctx, cancel := context.WithCancel(context.Background())
+	z := &zebraClient{
+		server:             s,
+		url:                url,
+		protos:             append([]string(nil), protos...),
+		preferredVersion:   version,
+		zapiVersions:       append([]uint8(nil), zapivers[:]...),
+		software:           software,
+		nhtEnable:          nhtEnable,
+		nhtDelay:           nhtDelay,
+		mplsLabelRangeSize: mplsLabelRangeSize,
+		ctx:                ctx,
+		cancel:             cancel,
+		done:               make(chan struct{}),
+		nexthopCache:       make(nexthopStateCache),
+		pathVrfMap:         make(map[*table.Path]uint32),
 		mplsLabel: mplsLabelParameter{
 			rangeSize: mplsLabelRangeSize,
 			maps:      make(map[uint64]*table.Bitmap),
 		},
-		dead: make(chan struct{}),
+		// MPLS labels are added to the required set per session when the
+		// negotiated version supports them.
+		required: zebraSyncFIBRoutes | zebraSyncNexthopRegs,
 	}
-	go w.loop()
-	if mplsLabelRangeSize > 0 && cli.SupportMpls() {
-		if err = cli.SendGetLabelChunk(&zebra.GetLabelChunkBody{ChunkSize: mplsLabelRangeSize}); err != nil {
-			return nil, err
-		}
-	}
-	return w, nil
+
+	// Connecting, protocol negotiation and state resynchronization happen in
+	// the loop goroutine, which retries with a cancelable backoff when Zebra
+	// is not available yet.
+	s.shutdownWG.Add(1)
+	go func() {
+		defer s.shutdownWG.Done()
+		z.loop()
+	}()
+	return z, nil
 }
 
 func (z *zebraClient) assignMplsLabel() (uint32, error) {
@@ -667,9 +1177,16 @@ func (z *zebraClient) assignMplsLabel() (uint32, error) {
 }
 
 func (z *zebraClient) assignAndSendVrfMplsLabel(vrf *table.Vrf) error {
+	cli := z.activeClient()
+	if cli == nil {
+		// No active session (Zebra is down or reconnecting with backoff).
+		// The next session resynchronizes every VRF label from a freshly
+		// requested label chunk, so there is nothing to assign or send here.
+		return nil
+	}
 	var err error
 	if vrf.MplsLabel, err = z.assignMplsLabel(); vrf.MplsLabel > 0 { // success
-		if err = z.client.SendVrfLabel(vrf.MplsLabel, vrf.Id); err != nil {
+		if err = cli.SendVrfLabel(vrf.MplsLabel, vrf.Id); err != nil {
 			return err
 		}
 	} else if vrf.MplsLabel == 0 { // GetLabelChunk is not performed

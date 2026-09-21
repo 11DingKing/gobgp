@@ -16,6 +16,7 @@
 package zebra
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
@@ -1370,6 +1372,7 @@ type Client struct {
 	Version       uint8
 	Software      Software
 	logger        *slog.Logger
+	closeOnce     sync.Once
 }
 
 func ReceiveSingleMsg(logger *slog.Logger, conn net.Conn, version uint8, software Software, topic string) (*Message, error) {
@@ -1429,7 +1432,15 @@ func ReceiveSingleMsg(logger *slog.Logger, conn net.Conn, version uint8, softwar
 
 // NewClient returns a Client instance (Client constructor)
 func NewClient(logger *slog.Logger, network, address string, typ RouteType, version uint8, software Software, mplsLabelRangeSize uint32) (*Client, error) {
-	conn, err := net.Dial(network, address)
+	return NewClientWithContext(context.Background(), logger, network, address, typ, version, software, mplsLabelRangeSize)
+}
+
+// NewClientWithContext is NewClient with a cancellable context. Canceling ctx
+// aborts an in-progress dial and the initial protocol exchange, so a caller
+// that is shutting down never gets stuck waiting for Zebra.
+func NewClientWithContext(ctx context.Context, logger *slog.Logger, network, address string, typ RouteType, version uint8, software Software, mplsLabelRangeSize uint32) (*Client, error) {
+	dialer := &net.Dialer{}
+	conn, err := dialer.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
@@ -1467,7 +1478,7 @@ func NewClient(logger *slog.Logger, network, address string, typ RouteType, vers
 						slog.String("Topic", "Zebra"),
 						slog.String("Error", err.Error()),
 					)
-					closeChannel(outgoing)
+					c.Close()
 					return
 				}
 			} else {
@@ -1491,9 +1502,21 @@ func NewClient(logger *slog.Logger, network, address string, typ RouteType, vers
 		}
 	}
 
-	// Try to receive the first message from Zebra.
+	// Try to receive the first message from Zebra. The blocking read is
+	// interrupted when ctx is canceled so that an unreachable or silent Zebra
+	// cannot delay shutdown indefinitely.
+	exchangeDone := make(chan struct{})
+	defer close(exchangeDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			conn.Close()
+		case <-exchangeDone:
+		}
+	}()
+
 	if m, err := ReceiveSingleMsg(logger, conn, version, software, "Zebra"); err != nil {
-		c.close()
+		c.Close()
 		// Return error explicitly in order to retry connection.
 		return nil, err
 	} else if m != nil {
@@ -1700,26 +1723,21 @@ func (c *Client) SendVrfLabel(label uint32, vrfID uint32) error {
 	return nil
 }
 
-// for avoiding double close
-func closeChannel(ch chan *Message) bool {
-	select {
-	case _, ok := <-ch:
-		if ok {
-			close(ch)
-			return true
+// Close terminates the connection and its sender/receiver goroutines. It is
+// safe to call Close multiple times and from multiple goroutines. Blocking
+// sends are interrupted because closing outgoing makes Send* return through
+// the send() recover path.
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		close(c.outgoing)
+		if c.conn != nil {
+			c.conn.Close()
 		}
-	default:
-	}
-	return false
-}
-
-func (c *Client) close() {
-	closeChannel(c.outgoing)
-	c.conn.Close()
+	})
 }
 
 // SetLabelFlag is referred in zclient, this func sets label flag
-func (c Client) SetLabelFlag(msgFlags *MessageFlag, nexthop *Nexthop) {
+func (c *Client) SetLabelFlag(msgFlags *MessageFlag, nexthop *Nexthop) {
 	if c.Version == 6 && c.Software.name == "frr" {
 		nexthop.flags |= zapiNexthopFlagLabel
 	} else if c.Version > 4 {

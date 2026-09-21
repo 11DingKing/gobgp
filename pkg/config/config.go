@@ -298,9 +298,9 @@ func InitialConfig(ctx context.Context, bgpServer *server.BgpServer, newConfig *
 			SoftwareName:         newConfig.Zebra.Config.SoftwareName,
 		})
 		if err != nil {
-			// Do not abort startup here. zebra.NewClient dials the zserv
-			// socket once and never retries, so this fails when zebra is
-			// not listening yet, not when the config is wrong.
+			// Do not abort startup here. A configuration error is reported
+			// synchronously, while an unreachable zserv socket keeps being
+			// retried in the background with a cancelable backoff.
 			bgpServer.Log().Error("failed to set zebra config",
 				slog.String("Topic", "config"), slog.Any("Error", err))
 		}

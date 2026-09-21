@@ -2263,6 +2263,13 @@ func (s *BgpServer) StopBgp(ctx context.Context, r *api.StopBgpRequest) error {
 		for _, l := range s.listeners {
 			l.Close()
 		}
+		// Terminate the Zebra integration immediately: cancel any in-flight
+		// dial, backoff wait and state replay and do not reconnect.
+		if s.zclient != nil {
+			zc := s.zclient
+			s.zclient = nil
+			zc.stop()
+		}
 		s.keychainStore.clearAllKeychains()
 		s.bgpConfig.Global = oc.Global{}
 		return nil

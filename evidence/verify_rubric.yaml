@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "首次 zserv 不可达或运行中连接断开时会进入可取消退避并在服务恢复后建立新的 ZAPI 会话，不再读取关闭通道形成忙循环。"
+  - id: 2
+    type: f2p
+    text: "每个新会话重新完成版本协商、接口订阅和配置的 redistribute 订阅，旧会话的迟到消息不能修改当前状态。"
+  - id: 3
+    type: f2p
+    text: "断线前从 Zebra 导入而新会话尚未重新通告的路由会被清理，其他来源的 BGP 路由不受影响。"
+  - id: 4
+    type: f2p
+    text: "重连后从当前 RIB 重放应存在的 FIB 路由，并包含断线期间发生的新增、撤销和 best-path 变化且不重复下发。"
+  - id: 5
+    type: f2p
+    text: "nexthop 可达性缓存按会话重建，当前路径需要的注册会重新发送，旧会话的 metric 或不可达状态不会泄漏。"
+  - id: 6
+    type: f2p
+    text: "启用 MPLS label 管理时重新申请有效 label chunk 并恢复各 VRF 发布，局部失败保持未同步且可重试而不会误报健康。"
+  - id: 7
+    type: f2p
+    text: "主动停止 BGP 或关闭 Zebra 集成会终止连接、退避和重放任务，停止后即使 zserv 恢复也不会自动连接。"
+  - id: 8
+    type: p2p
+    text: "首次连接成功、未启用 NHT 或 MPLS、ZAPI 版本回退及正常增量收发的既有行为保持兼容。"
