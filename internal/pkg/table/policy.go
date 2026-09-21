@@ -4789,6 +4789,69 @@ func NewRoutingPolicy(logger *slog.Logger) *RoutingPolicy {
 	}
 }
 
+// PolicyState is an opaque snapshot of the policy objects installed on a
+// RoutingPolicy. SnapshotState/RestoreState let a transactional configuration
+// reload put the previous generation back when a later stage fails. The set,
+// policy and statement maps are replaced wholesale by Reset and never mutated
+// in place, so keeping the map references is enough; assignments are mutated
+// in place by setPolicy/setDefaultPolicy and therefore copied.
+type PolicyState struct {
+	definedSetMap DefinedSetMap
+	policyMap     map[string]*Policy
+	statementMap  map[string]*Statement
+	assignmentMap map[string]*Assignment
+}
+
+// SnapshotState captures the currently installed policy generation. It must be
+// called before the transaction installs any policy object.
+func (r *RoutingPolicy) SnapshotState() PolicyState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	assignments := make(map[string]*Assignment, len(r.assignmentMap))
+	for id, a := range r.assignmentMap {
+		assignments[id] = &Assignment{
+			importPolicies:      slices.Clone(a.importPolicies),
+			defaultImportPolicy: a.defaultImportPolicy,
+			exportPolicies:      slices.Clone(a.exportPolicies),
+			defaultExportPolicy: a.defaultExportPolicy,
+		}
+	}
+	return PolicyState{
+		definedSetMap: r.definedSetMap,
+		policyMap:     r.policyMap,
+		statementMap:  r.statementMap,
+		assignmentMap: assignments,
+	}
+}
+
+// RestoreState reinstalls a previously captured policy generation. It is the
+// rollback companion of Reset and must not be called once the snapshot's
+// generation has been committed.
+func (r *RoutingPolicy) RestoreState(state PolicyState) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.definedSetMap = state.definedSetMap
+	r.policyMap = state.policyMap
+	r.statementMap = state.statementMap
+	r.assignmentMap = state.assignmentMap
+}
+
+// ValidateRoutingPolicy builds every defined set, policy and statement and
+// resolves all of their conditions without installing anything on a live
+// RoutingPolicy. Reload callers use it to reject a configuration generation
+// before mutating the running policy objects.
+func ValidateRoutingPolicy(rp *oc.RoutingPolicy) error {
+	if rp == nil {
+		return fmt.Errorf("routing policy is nil")
+	}
+	// A throwaway policy runs exactly the same construction and validation as
+	// Reset/reload; its maps are discarded, so a failed validation leaves no
+	// trace behind.
+	return NewRoutingPolicy(slog.Default()).reload(*rp)
+}
+
 func CanImportToVrf(v *Vrf, path *Path) bool {
 	extComms := path.GetExtCommunities()
 	for _, x := range extComms {

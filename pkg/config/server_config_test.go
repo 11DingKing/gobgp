@@ -185,15 +185,51 @@ func TestInitialConfigReturnsConfigErrors(t *testing.T) {
 	}
 }
 
-func TestUpdateConfigKeepsConfigErrorsNonFatal(t *testing.T) {
+// TestUpdateConfigRejectsInvalidGeneration verifies that a reload is one
+// configuration generation: a policy that fails validation is rejected, the
+// error reaches the caller, the generation counter does not move and the
+// daemon keeps serving the previous configuration. A fixed reload then
+// succeeds and advances the generation, proving the failed attempt left
+// nothing behind.
+func TestUpdateConfigRejectsInvalidGeneration(t *testing.T) {
 	ctx := context.Background()
 	bgpServer, handler := newTestBgpServer(t)
 
 	currentConfig, err := InitialConfig(ctx, bgpServer, validConfig(), false)
 	require.NoError(t, err)
+	require.Equal(t, uint64(1), bgpServer.ConfigGeneration())
 
-	_, err = UpdateConfig(ctx, bgpServer, currentConfig, configWithMissingPolicySet())
+	returned, err := UpdateConfig(ctx, bgpServer, currentConfig, configWithMissingPolicySet())
+	require.Error(t, err)
+	// the caller keeps the previous configuration generation...
+	require.Same(t, currentConfig, returned)
+	// ...and the server did not advance to a broken generation.
+	assert.Equal(t, uint64(1), bgpServer.ConfigGeneration())
+	assert.Contains(t, handler.Errors(), "failed to validate policy config")
+
+	// A corrected reload is computed from the previous generation and commits.
+	fixed := validConfig()
+	fixed.PeerGroups = []oc.PeerGroup{{
+		Config: oc.PeerGroupConfig{PeerGroupName: "router", PeerAs: 2},
+	}}
+	returned, err = UpdateConfig(ctx, bgpServer, currentConfig, fixed)
+	require.NoError(t, err)
+	require.NotNil(t, returned)
+	assert.Equal(t, uint64(2), bgpServer.ConfigGeneration())
+	assert.Equal(t, []string{"router"}, listPeerGroupNames(t, bgpServer))
+}
+
+// TestUpdateConfigNoopKeepsGeneration verifies that an unchanged reload keeps
+// the historical no-op behavior and must not advance the generation.
+func TestUpdateConfigNoopKeepsGeneration(t *testing.T) {
+	ctx := context.Background()
+	bgpServer, _ := newTestBgpServer(t)
+
+	currentConfig, err := InitialConfig(ctx, bgpServer, configWithValidPeerGroup(), false)
 	require.NoError(t, err)
 
-	assert.Contains(t, handler.Errors(), "failed to set policies")
+	returned, err := UpdateConfig(ctx, bgpServer, currentConfig, configWithValidPeerGroup())
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), bgpServer.ConfigGeneration())
+	assert.NotNil(t, returned)
 }

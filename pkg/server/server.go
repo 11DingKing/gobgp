@@ -159,6 +159,11 @@ type BgpServer struct {
 	logger        *slog.Logger
 	logLevelVar   *slog.LevelVar
 	timingHook    FSMTimingHook
+
+	// configGeneration identifies the configuration generation currently in
+	// effect. The initial configuration is generation 1 and every successful
+	// transactional reload advances it; failed reloads leave it unchanged.
+	configGeneration atomic.Uint64
 	// manage lifecycle of the server
 	isServing     atomic.Bool
 	shutdownWG    *sync.WaitGroup
@@ -250,6 +255,16 @@ func (s *BgpServer) active() error {
 		return fmt.Errorf("bgp server hasn't started yet")
 	}
 	return nil
+}
+
+// ConfigGeneration returns the configuration generation currently committed.
+// The initial configuration installs generation 1; each successful
+// transactional reload (CommitConfigGeneration) advances the value and a
+// failed reload keeps serving the previous generation, so callers can compare
+// the value before and after a reload to tell which generation management
+// queries, peers, dynamic neighbors and TCP-AO keychains observe.
+func (s *BgpServer) ConfigGeneration() uint64 {
+	return s.configGeneration.Load()
 }
 
 type mgmtOp struct {
@@ -2284,6 +2299,18 @@ func (s *BgpServer) SetPolicies(ctx context.Context, r *api.SetPoliciesRequest) 
 		return err
 	}
 
+	return s.mgmtOperation(func() error {
+		return s.resetPolicy(rp)
+	}, false)
+}
+
+// resetPolicy installs a fully built routing policy. The currently configured
+// policy assignments (global table plus every route-server-client peer) are
+// captured first and re-applied to the new policy, which is the same behavior
+// the gRPC SetPolicies API has always provided. It must be called on the
+// management goroutine (or from a transaction running there); the caller is
+// responsible for restoring the previous policy state when it rolls back.
+func (s *BgpServer) resetPolicy(rp *oc.RoutingPolicy) error {
 	getConfig := func(id string) (*oc.ApplyPolicy, error) {
 		f := func(id string, dir table.PolicyDirection) (oc.DefaultPolicyType, []string, error) {
 			rt, policies, err := s.policy.GetPolicyAssignment(id, dir)
@@ -2317,27 +2344,56 @@ func (s *BgpServer) SetPolicies(ctx context.Context, r *api.SetPoliciesRequest) 
 		return c, nil
 	}
 
-	return s.mgmtOperation(func() error {
-		ap := make(map[string]oc.ApplyPolicy, len(s.neighborMap)+1)
-		a, err := getConfig(table.GLOBAL_RIB_NAME)
+	ap := make(map[string]oc.ApplyPolicy, len(s.neighborMap)+1)
+	a, err := getConfig(table.GLOBAL_RIB_NAME)
+	if err != nil {
+		return err
+	}
+	ap[table.GLOBAL_RIB_NAME] = *a
+	for _, peer := range s.neighborMap {
+		if !peer.isRouteServerClient() {
+			continue
+		}
+		peer.fsm.logger.Info("call set policy")
+
+		a, err := getConfig(peer.ID())
 		if err != nil {
 			return err
 		}
-		ap[table.GLOBAL_RIB_NAME] = *a
-		for _, peer := range s.neighborMap {
-			if !peer.isRouteServerClient() {
-				continue
-			}
-			peer.fsm.logger.Info("call set policy")
+		ap[peer.ID()] = *a
+	}
+	return s.policy.Reset(rp, ap)
+}
 
-			a, err := getConfig(peer.ID())
-			if err != nil {
-				return err
-			}
-			ap[peer.ID()] = *a
+// setGlobalPolicyAssignment installs the global import/export policy
+// assignment. It mirrors the config-file handling: referenced policies are
+// looked up by name and a missing name fails the stage. It must be called on
+// the management goroutine.
+func (s *BgpServer) setGlobalPolicyAssignment(a *oc.ApplyPolicyConfig) error {
+	toDefaultTable := func(r oc.DefaultPolicyType) table.RouteType {
+		var def table.RouteType
+		switch r {
+		case oc.DEFAULT_POLICY_TYPE_ACCEPT_ROUTE:
+			def = table.ROUTE_TYPE_ACCEPT
+		case oc.DEFAULT_POLICY_TYPE_REJECT_ROUTE:
+			def = table.ROUTE_TYPE_REJECT
 		}
-		return s.policy.Reset(rp, ap)
-	}, false)
+		return def
+	}
+	toPolicies := func(names []string) []*oc.PolicyDefinition {
+		p := make([]*oc.PolicyDefinition, 0, len(names))
+		for _, name := range names {
+			p = append(p, &oc.PolicyDefinition{Name: name})
+		}
+		return p
+	}
+
+	if err := s.policy.SetPolicyAssignment(table.GLOBAL_RIB_NAME, table.POLICY_DIRECTION_IMPORT,
+		toPolicies(a.ImportPolicyList), toDefaultTable(a.DefaultImportPolicy)); err != nil {
+		return err
+	}
+	return s.policy.SetPolicyAssignment(table.GLOBAL_RIB_NAME, table.POLICY_DIRECTION_EXPORT,
+		toPolicies(a.ExportPolicyList), toDefaultTable(a.DefaultExportPolicy))
 }
 
 // EVPN MAC MOBILITY HANDLING
@@ -2736,6 +2792,9 @@ func (s *BgpServer) StartBgp(ctx context.Context, r *api.StartBgpRequest) error 
 				return err
 			}
 		}
+		// The initial configuration is generation one. Objects added after
+		// StartBgp belong to this same startup generation.
+		s.configGeneration.Store(1)
 		return nil
 	}, false)
 }
@@ -3794,35 +3853,70 @@ func (s *BgpServer) AddDynamicNeighbor(ctx context.Context, r *api.AddDynamicNei
 				PeerGroup: r.DynamicNeighbor.PeerGroup,
 			},
 		}
-		pg, ok := s.peerGroupMap[c.Config.PeerGroup]
-		if !ok {
-			return fmt.Errorf("no such peer-group: %s", c.Config.PeerGroup)
-		}
-		if pg.Conf.TcpAo.Config.Keychain != "" {
-			return status.Error(codes.Unimplemented, "TCP-AO dynamic neighbors are not supported")
-		}
-		pg.AddDynamicNeighbor(c)
-
-		pConf := pg.Conf
-		if pConf.Config.AuthPassword != "" {
-			prefix := r.DynamicNeighbor.Prefix
-			addr, _, _ := net.ParseCIDR(prefix)
-			for _, l := range s.listListeners(addr.String()) {
-				if err := netutils.SetTCPMD5SigSockopt(l, pConf.Transport.Config.BindInterface, prefix, pConf.Config.AuthPassword); err != nil {
-					s.logger.Warn("failed to set md5",
-						slog.String("Topic", "Peer"),
-						slog.String("Key", prefix),
-						slog.String("Err", err.Error()))
-				} else {
-					s.logger.Info("successfully set md5 for dynamic peer",
-						slog.String("Topic", "Peer"),
-						slog.String("Key", prefix),
-					)
-				}
-			}
-		}
-		return nil
+		return s.addDynamicNeighbor(c)
 	}, true)
+}
+
+// addDynamicNeighbor enables dynamic neighbor discovery for one prefix of a
+// peer group. It must be called on the management goroutine.
+func (s *BgpServer) addDynamicNeighbor(c *oc.DynamicNeighbor) error {
+	pg, ok := s.peerGroupMap[c.Config.PeerGroup]
+	if !ok {
+		return fmt.Errorf("no such peer-group: %s", c.Config.PeerGroup)
+	}
+	if pg.Conf.TcpAo.Config.Keychain != "" {
+		return status.Error(codes.Unimplemented, "TCP-AO dynamic neighbors are not supported")
+	}
+	pg.AddDynamicNeighbor(c)
+
+	s.configureDynamicNeighborMd5(pg.Conf, c.Config.Prefix.String(), true)
+	return nil
+}
+
+// configureDynamicNeighborMd5 installs or removes the TCP-MD5 password of a
+// dynamic-neighbor prefix on every matching listener. Socket errors are
+// warnings only, matching the historical API behavior.
+func (s *BgpServer) configureDynamicNeighborMd5(pConf *oc.PeerGroup, prefix string, install bool) {
+	if pConf.Config.AuthPassword == "" {
+		return
+	}
+	password := ""
+	if install {
+		password = pConf.Config.AuthPassword
+	}
+	addr, _, err := net.ParseCIDR(prefix)
+	if err != nil {
+		s.logger.Warn("cannot configure md5 for dynamic peer, invalid prefix",
+			slog.String("Topic", "Peer"),
+			slog.String("Key", prefix),
+			slog.String("Err", err.Error()))
+		return
+	}
+	for _, l := range s.listListeners(addr.String()) {
+		if err := netutils.SetTCPMD5SigSockopt(l, pConf.Transport.Config.BindInterface, prefix, password); err != nil {
+			s.logger.Warn("failed to configure md5",
+				slog.String("Topic", "Peer"),
+				slog.String("Key", prefix),
+				slog.String("Err", err.Error()))
+		} else if install {
+			s.logger.Info("successfully set md5 for dynamic peer",
+				slog.String("Topic", "Peer"),
+				slog.String("Key", prefix),
+			)
+		}
+	}
+}
+
+// deleteDynamicNeighbor disables dynamic neighbor discovery for one prefix of
+// a peer group. It must be called on the management goroutine.
+func (s *BgpServer) deleteDynamicNeighbor(peerGroupName, prefix string) error {
+	pg, ok := s.peerGroupMap[peerGroupName]
+	if !ok {
+		return fmt.Errorf("no such peer-group: %s", peerGroupName)
+	}
+	pg.DeleteDynamicNeighbor(prefix)
+	s.configureDynamicNeighborMd5(pg.Conf, prefix, false)
+	return nil
 }
 
 func (s *BgpServer) deletePeerGroup(name string) error {
@@ -3931,38 +4025,15 @@ func (s *BgpServer) DeleteDynamicNeighbor(ctx context.Context, r *api.DeleteDyna
 		return fmt.Errorf("dynamic neighbor requires the peer group config")
 	}
 	return s.mgmtOperation(func() error {
-		pg, ok := s.peerGroupMap[r.PeerGroup]
-		if !ok {
-			return fmt.Errorf("no such peer-group: %s", r.PeerGroup)
-		}
-		pg.DeleteDynamicNeighbor(r.Prefix)
-
-		pConf := pg.Conf
-		if pConf.Config.AuthPassword != "" {
-			prefix := r.Prefix
-			addr, _, perr := net.ParseCIDR(prefix)
-			if perr == nil {
-				for _, l := range s.listListeners(addr.String()) {
-					if err := netutils.SetTCPMD5SigSockopt(l, pConf.Transport.Config.BindInterface, prefix, ""); err != nil {
-						s.logger.Warn("failed to clear md5",
-							slog.String("Topic", "Peer"),
-							slog.String("Key", prefix),
-							slog.String("Err", err.Error()))
-					}
-				}
-			} else {
-				s.logger.Warn("Cannot clear up dynamic MD5, invalid prefix",
-					slog.String("Topic", "Peer"),
-					slog.String("Key", prefix),
-					slog.String("Err", perr.Error()),
-				)
-			}
-		}
-		return nil
+		return s.deleteDynamicNeighbor(r.PeerGroup, r.Prefix)
 	}, true)
 }
 
 func (s *BgpServer) updatePeerGroup(pg *oc.PeerGroup) (needsSoftResetIn bool, err error) {
+	return s.updatePeerGroupTx(pg, nil)
+}
+
+func (s *BgpServer) updatePeerGroupTx(pg *oc.PeerGroup, tx *configGenerationTx) (needsSoftResetIn bool, err error) {
 	name := pg.Config.PeerGroupName
 
 	group, ok := s.peerGroupMap[name]
@@ -3972,10 +4043,18 @@ func (s *BgpServer) updatePeerGroup(pg *oc.PeerGroup) (needsSoftResetIn bool, er
 	if pg.TcpAo.Config.Keychain != "" && len(group.dynamicNeighbors) != 0 {
 		return false, status.Error(codes.Unimplemented, "TCP-AO dynamic neighbors are not supported")
 	}
+	oldConf := group.Conf
 	group.Conf = pg
+	if tx != nil {
+		// Member configuration changes record their own undo steps; LIFO
+		// order restores the members first and the group configuration last.
+		tx.push(func() {
+			group.Conf = oldConf
+		})
+	}
 
 	for _, n := range group.members {
-		u, err := s.updateNeighbor(&n)
+		u, err := s.updateNeighborTx(&n, tx)
 		if err != nil {
 			return needsSoftResetIn, err
 		}
@@ -4001,6 +4080,15 @@ func (s *BgpServer) UpdatePeerGroup(ctx context.Context, r *api.UpdatePeerGroupR
 }
 
 func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err error) {
+	return s.updateNeighborTx(c, nil)
+}
+
+// updateNeighborTx applies a neighbor configuration update. A non-nil tx makes
+// it one stage of a transactional configuration generation: every successfully
+// applied change records its inverse on tx, so that a later failing stage can
+// restore the previous generation. It must be called on the management
+// goroutine.
+func (s *BgpServer) updateNeighborTx(c *oc.Neighbor, tx *configGenerationTx) (needsSoftResetIn bool, err error) {
 	var pgConf *oc.PeerGroup
 	if c.Config.PeerGroup != "" {
 		if pg, ok := s.peerGroupMap[c.Config.PeerGroup]; ok {
@@ -4017,14 +4105,19 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 	if err != nil {
 		return needsSoftResetIn, err
 	}
+	ipAddr := netip.MustParseAddr(addr)
 
-	peer, ok := s.neighborMap[netip.MustParseAddr(addr)]
+	peer, ok := s.neighborMap[ipAddr]
 	if !ok {
 		return needsSoftResetIn, fmt.Errorf("neighbor that has %v doesn't exist", addr)
 	}
 
 	peer.fsm.lock.Lock()
 	original := peer.fsm.pConf.ReadOnly()
+	// originalCopy is the fully resolved previous generation configuration;
+	// the transaction uses it to rebuild the peer when the update replaced the
+	// peer object, or to replay the update backwards for in-place changes.
+	originalCopy := peer.fsm.pConf.ReadCopy()
 	conf := peer.fsm.pConf.ReadCopy()
 	if !conf.ApplyPolicy.Equal(&c.ApplyPolicy) {
 		peer.fsm.logger.Info("Update ApplyPolicy")
@@ -4079,9 +4172,38 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 			peer.fsm.logger.Error("failed to delete neighbor", slog.String("Err", err.Error()))
 			return needsSoftResetIn, err
 		}
+		if tx != nil {
+			// deleteNeighbor stopped the old FSM and removed the peer from the
+			// indexes. Whatever addNeighbor does next, rollback must leave a
+			// peer running the previous generation configuration.
+			target := *c
+			tx.push(func() {
+				if current, exists := s.neighborMap[ipAddr]; exists {
+					currentConf := current.fsm.pConf.ReadCopy()
+					if derr := s.deleteNeighbor(&currentConf, bgp.BGP_ERROR_CEASE, bgp.BGP_ERROR_SUB_PEER_DECONFIGURED, false); derr != nil {
+						s.logger.Warn("failed to remove replaced peer during rollback",
+							slog.String("Topic", "config"),
+							slog.String("Key", addr),
+							slog.Any("Error", derr))
+					}
+				} else {
+					// addNeighbor failed after configuring the listeners but
+					// before registering the new peer; drop that material.
+					s.removeNeighborListenerAuth(&target)
+				}
+				previous := originalCopy
+				if aerr := s.addNeighbor(&previous); aerr != nil {
+					s.logger.Warn("failed to restore previous peer configuration",
+						slog.String("Topic", "config"),
+						slog.String("Key", addr),
+						slog.Any("Error", aerr))
+				}
+			})
+		}
 		err = s.addNeighbor(c)
 		if err != nil {
-			// rollback to original ApplyPolicy
+			// rollback to original ApplyPolicy. With a transaction the peer is
+			// already out of the indexes; the recorded undo step re-adds it.
 			peer.fsm.pConf.Update(original)
 
 			peer.fsm.logger.Error("failed to add neighbor", slog.String("Err", err.Error()))
@@ -4114,29 +4236,44 @@ func (s *BgpServer) updateNeighbor(c *oc.Neighbor) (needsSoftResetIn bool, err e
 		conf.TcpAo = c.TcpAo
 	}
 
-	isLimit, err := peer.updatePrefixLimitConfig(&conf, c.AfiSafis)
-	if err == nil {
-		peer.fsm.pConf.Update(&conf)
-		peer.fsm.lock.Unlock()
-		s.rebuildLocalClusterIDs()
-		if bfdConfigChanged {
-			err = s.updateBfdPeer(
-				addr,
-				original.Bfd.Config, c.Bfd.Config,
-				original.Transport.Config.BindInterface, c.Transport.Config.BindInterface,
-			)
-		}
-		if isLimit {
-			if err == nil {
-				err = s.setAdminState(addr, "", adminStatePfxCt)
-			}
-		}
-	} else {
+	isLimit, lerr := peer.updatePrefixLimitConfig(&conf, c.AfiSafis)
+	if lerr != nil {
 		// rollback to original ApplyPolicy
 		peer.fsm.pConf.Update(original)
 		peer.fsm.lock.Unlock()
 
-		peer.fsm.logger.Error("failed to update prefixLimit", slog.String("Err", err.Error()))
+		peer.fsm.logger.Error("failed to update prefixLimit", slog.String("Err", lerr.Error()))
+		return needsSoftResetIn, lerr
+	}
+
+	peer.fsm.pConf.Update(&conf)
+	peer.fsm.lock.Unlock()
+	s.rebuildLocalClusterIDs()
+	if tx != nil {
+		// In-place update: the peer object keeps its identity and session.
+		// Replaying the update with the previous configuration reverses every
+		// effect below (BFD, TCP-AO binding, timers, apply policy).
+		previous := originalCopy
+		tx.push(func() {
+			if _, uerr := s.updateNeighbor(&previous); uerr != nil {
+				s.logger.Warn("failed to restore previous peer configuration",
+					slog.String("Topic", "config"),
+					slog.String("Key", addr),
+					slog.Any("Error", uerr))
+			}
+		})
+	}
+	if bfdConfigChanged {
+		err = s.updateBfdPeer(
+			addr,
+			original.Bfd.Config, c.Bfd.Config,
+			original.Transport.Config.BindInterface, c.Transport.Config.BindInterface,
+		)
+	}
+	if isLimit {
+		if err == nil {
+			err = s.setAdminState(addr, "", adminStatePfxCt)
+		}
 	}
 
 	return needsSoftResetIn, err

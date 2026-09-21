@@ -127,6 +127,43 @@ func UpdateNeighborConfig(logger *slog.Logger, curC, newC *BgpConfigSet) ([]Neig
 	return added, deleted, updated
 }
 
+// dynamicNeighborKey identifies one dynamic neighbor discovery range. A range
+// belongs to a peer group, so the group name and the prefix together are the
+// identity.
+func dynamicNeighborKey(d *DynamicNeighbor) string {
+	return d.Config.PeerGroup + "\x00" + d.Config.Prefix.String()
+}
+
+// UpdateDynamicNeighborConfig computes the dynamic neighbor discovery ranges
+// added and removed between two configuration sets. Ranges are matched by
+// peer group and prefix. Updated ranges are not supported: a change removes
+// the old range and adds the new one.
+func UpdateDynamicNeighborConfig(curC, newC *BgpConfigSet) (added, deleted []DynamicNeighbor) {
+	added = []DynamicNeighbor{}
+	deleted = []DynamicNeighbor{}
+
+	current := make(map[string]struct{}, len(curC.DynamicNeighbors))
+	for i := range curC.DynamicNeighbors {
+		current[dynamicNeighborKey(&curC.DynamicNeighbors[i])] = struct{}{}
+	}
+	desired := make(map[string]struct{}, len(newC.DynamicNeighbors))
+	for i := range newC.DynamicNeighbors {
+		desired[dynamicNeighborKey(&newC.DynamicNeighbors[i])] = struct{}{}
+	}
+
+	for i := range newC.DynamicNeighbors {
+		if _, ok := current[dynamicNeighborKey(&newC.DynamicNeighbors[i])]; !ok {
+			added = append(added, newC.DynamicNeighbors[i])
+		}
+	}
+	for i := range curC.DynamicNeighbors {
+		if _, ok := desired[dynamicNeighborKey(&curC.DynamicNeighbors[i])]; !ok {
+			deleted = append(deleted, curC.DynamicNeighbors[i])
+		}
+	}
+	return added, deleted
+}
+
 func CheckPolicyDifference(logger *slog.Logger, currentPolicy *RoutingPolicy, newPolicy *RoutingPolicy) bool {
 	logger.Debug("Current policy", slog.String("Topic", "Config"), slog.Any("Key", currentPolicy))
 	logger.Debug("New policy", slog.String("Topic", "Config"), slog.Any("Key", newPolicy))

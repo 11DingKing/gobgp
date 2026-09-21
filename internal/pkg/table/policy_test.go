@@ -4461,3 +4461,106 @@ func BenchmarkPrefixConditionEvaluate(b *testing.B) {
 		})
 	}
 }
+
+// TestRoutingPolicySnapshotRestore verifies that SnapshotState/RestoreState
+// bring back the defined sets, policies and assignments of the previous
+// configuration generation after a new policy set has been installed.
+func TestRoutingPolicySnapshotRestore(t *testing.T) {
+	r := NewRoutingPolicy(logger)
+	require.NoError(t, r.Initialize())
+
+	rp1 := &oc.RoutingPolicy{
+		DefinedSets: oc.DefinedSets{
+			NeighborSets: []oc.NeighborSet{{
+				NeighborSetName:  "ns1",
+				NeighborInfoList: []string{"10.0.0.1"},
+			}},
+		},
+		PolicyDefinitions: []oc.PolicyDefinition{{
+			Name: "p1",
+			Statements: []oc.Statement{{
+				Name: "s1",
+				Conditions: oc.Conditions{
+					MatchNeighborSet: oc.MatchNeighborSet{
+						NeighborSet:     "ns1",
+						MatchSetOptions: oc.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,
+					},
+				},
+			}},
+		}},
+	}
+	require.NoError(t, r.Reset(rp1, map[string]oc.ApplyPolicy{
+		GLOBAL_RIB_NAME: {
+			Config: oc.ApplyPolicyConfig{
+				ImportPolicyList:    []string{"p1"},
+				DefaultImportPolicy: oc.DEFAULT_POLICY_TYPE_ACCEPT_ROUTE,
+				ExportPolicyList:    nil,
+				DefaultExportPolicy: oc.DEFAULT_POLICY_TYPE_ACCEPT_ROUTE,
+			},
+		},
+	}))
+
+	snapshot := r.SnapshotState()
+
+	// Install a different generation: ns1/p1 disappear and assignments reset.
+	require.NoError(t, r.Reset(&oc.RoutingPolicy{}, nil))
+	_, policies, err := r.GetPolicyAssignment(GLOBAL_RIB_NAME, POLICY_DIRECTION_IMPORT)
+	require.NoError(t, err)
+	assert.Empty(t, policies)
+	missing, err := r.GetDefinedSet(DEFINED_TYPE_NEIGHBOR, "ns1")
+	require.NoError(t, err)
+	assert.Empty(t, missing.NeighborSets)
+
+	// Restore and confirm the previous generation is observable again.
+	r.RestoreState(snapshot)
+	set, err := r.GetDefinedSet(DEFINED_TYPE_NEIGHBOR, "ns1")
+	require.NoError(t, err)
+	require.Len(t, set.NeighborSets, 1)
+	assert.Equal(t, "ns1", set.NeighborSets[0].NeighborSetName)
+	_, policies, err = r.GetPolicyAssignment(GLOBAL_RIB_NAME, POLICY_DIRECTION_IMPORT)
+	require.NoError(t, err)
+	require.Len(t, policies, 1)
+	assert.Equal(t, "p1", policies[0].Name)
+}
+
+// TestValidateRoutingPolicy rejects policies that reference undefined sets
+// without installing anything and accepts well-formed ones.
+func TestValidateRoutingPolicy(t *testing.T) {
+	valid := &oc.RoutingPolicy{
+		DefinedSets: oc.DefinedSets{
+			NeighborSets: []oc.NeighborSet{{
+				NeighborSetName:  "ns1",
+				NeighborInfoList: []string{"10.0.0.1"},
+			}},
+		},
+		PolicyDefinitions: []oc.PolicyDefinition{{
+			Name: "p1",
+			Statements: []oc.Statement{{
+				Name: "s1",
+				Conditions: oc.Conditions{
+					MatchNeighborSet: oc.MatchNeighborSet{
+						NeighborSet:     "ns1",
+						MatchSetOptions: oc.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,
+					},
+				},
+			}},
+		}},
+	}
+	require.NoError(t, ValidateRoutingPolicy(valid))
+
+	invalid := &oc.RoutingPolicy{
+		PolicyDefinitions: []oc.PolicyDefinition{{
+			Name: "bad",
+			Statements: []oc.Statement{{
+				Name: "s1",
+				Conditions: oc.Conditions{
+					MatchNeighborSet: oc.MatchNeighborSet{
+						NeighborSet:     "missing",
+						MatchSetOptions: oc.MATCH_SET_OPTIONS_RESTRICTED_TYPE_ANY,
+					},
+				},
+			}},
+		}},
+	}
+	assert.Error(t, ValidateRoutingPolicy(invalid))
+}

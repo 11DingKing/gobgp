@@ -283,7 +283,9 @@ func main() {
 		}
 
 		logger.Info("Reload the config file")
-		// Avoid crashing gobgpd on reload - it shouldn't flush policy entirely, so it's safe to continue to run
+		// A failed reload is one rejected configuration generation:
+		// UpdateConfig rolls every applied object back and keeps serving the
+		// previous generation, so the daemon can safely stay running.
 		newConfig, err := config.ReadConfigFile(opts.ConfigFile, opts.ConfigType)
 		if err != nil {
 			logger.Warn("Can't read config file", slog.String("File", opts.ConfigFile), slog.String("Error", err.Error()))
@@ -292,7 +294,8 @@ func main() {
 
 		currentConfig, err = config.UpdateConfig(context.Background(), bgpServer, currentConfig, newConfig)
 		if err != nil {
-			logger.Warn("Failed to update config", slog.String("File", opts.ConfigFile), slog.String("Error", err.Error()))
+			logger.Warn("Failed to update config, keeping the previous configuration generation",
+				slog.String("File", opts.ConfigFile), slog.String("Error", err.Error()))
 			continue
 		}
 	}

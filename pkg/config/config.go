@@ -27,8 +27,7 @@ func WatchConfigFile(configFile, configType string, callBack func()) {
 }
 
 const (
-	stopOnConfigError     = true
-	continueOnConfigError = false
+	stopOnConfigError = true
 )
 
 func marshalRouteTargets(l []string) ([]*api.RouteTarget, error) {
@@ -135,49 +134,6 @@ func addPeerGroups(ctx context.Context, bgpServer *server.BgpServer, addedPg []o
 	return nil
 }
 
-func deletePeerGroups(ctx context.Context, bgpServer *server.BgpServer, deletedPg []oc.PeerGroup) {
-	for _, pg := range deletedPg {
-		bgpServer.Log().Info("delete peer group",
-			slog.String("Topic", "config"),
-			slog.String("Key", pg.Config.PeerGroupName),
-		)
-		err := bgpServer.DeletePeerGroup(ctx, &api.DeletePeerGroupRequest{
-			Name: pg.Config.PeerGroupName,
-		})
-		if err != nil {
-			bgpServer.Log().Error("failed to delete peer group",
-				slog.String("Topic", "config"),
-				slog.String("Key", pg.Config.PeerGroupName),
-				slog.Any("Error", err),
-			)
-		}
-	}
-}
-
-func updatePeerGroups(ctx context.Context, bgpServer *server.BgpServer, updatedPg []oc.PeerGroup) bool {
-	needsSoftResetIn := false
-	for _, pg := range updatedPg {
-		bgpServer.Log().Info("update peer group",
-			slog.String("Topic", "config"),
-			slog.String("Key", pg.Config.PeerGroupName),
-		)
-		u, err := bgpServer.UpdatePeerGroup(ctx, &api.UpdatePeerGroupRequest{
-			PeerGroup: oc.NewPeerGroupFromConfigStruct(&pg),
-		})
-		if err != nil {
-			bgpServer.Log().Error("failed to update peer group",
-				slog.String("Topic", "config"),
-				slog.String("Key", pg.Config.PeerGroupName),
-				slog.Any("Error", err),
-			)
-			continue
-		}
-		needsSoftResetIn = needsSoftResetIn || u.NeedsSoftResetIn
-	}
-
-	return needsSoftResetIn
-}
-
 func addDynamicNeighbors(ctx context.Context, bgpServer *server.BgpServer, dynamicNeighbors []oc.DynamicNeighbor, stopOnError bool) error {
 	for _, dn := range dynamicNeighbors {
 		bgpServer.Log().Info("add dynamic neighbor to peer group",
@@ -228,47 +184,6 @@ func addNeighbors(ctx context.Context, bgpServer *server.BgpServer, added []oc.N
 	}
 
 	return nil
-}
-
-func deleteNeighbors(ctx context.Context, bgpServer *server.BgpServer, deleted []oc.Neighbor) {
-	for _, p := range deleted {
-		bgpServer.Log().Info("delete peer",
-			slog.String("Topic", "config"),
-			slog.String("Key", p.State.NeighborAddress.String()),
-		)
-		err := bgpServer.DeletePeer(ctx, &api.DeletePeerRequest{
-			Address: p.State.NeighborAddress.String(),
-		})
-		if err != nil {
-			bgpServer.Log().Error("failed to delete peer",
-				slog.String("Topic", "config"),
-				slog.String("Key", p.State.NeighborAddress.String()),
-				slog.Any("Error", err),
-			)
-		}
-	}
-}
-
-func updateNeighbors(ctx context.Context, bgpServer *server.BgpServer, updated []oc.Neighbor) bool {
-	needsSoftResetIn := false
-	for _, p := range updated {
-		bgpServer.Log().Info("update peer",
-			slog.String("Topic", "config"), slog.String("Key", p.State.NeighborAddress.String()))
-		u, err := bgpServer.UpdatePeer(ctx, &api.UpdatePeerRequest{
-			Peer: oc.NewPeerFromConfigStruct(&p),
-		})
-		if err != nil {
-			bgpServer.Log().Error("failed to update peer",
-				slog.String("Topic", "config"),
-				slog.String("Key", p.State.NeighborAddress.String()),
-				slog.Any("Error", err),
-			)
-			continue
-		}
-		needsSoftResetIn = needsSoftResetIn || u.NeedsSoftResetIn
-	}
-
-	return needsSoftResetIn
 }
 
 // InitialConfig applies initial configuration to a pristine gobgp instance. It
@@ -471,67 +386,77 @@ func InitialConfig(ctx context.Context, bgpServer *server.BgpServer, newConfig *
 // hangle graceful restart and 2) requires a BgpConfigSet for the previous
 // configuration so that it can compute the delta between it and the new
 // config. The new BgpConfigSet can be obtained using ReadConfigFile.
-// Reload keeps the previous runtime behavior: config apply errors are logged,
-// but they do not abort the running daemon or reject the whole reload.
+//
+// The whole reload is one configuration generation: policies, peer groups,
+// neighbors, dynamic neighbors and TCP-AO keychains commit together. Any stage
+// failure returns an error, keeps serving the previous generation and undoes
+// objects already applied, so the caller can retry from the returned previous
+// BgpConfigSet without leftovers from the failed attempt. Only a fully
+// committed generation returns the new BgpConfigSet.
 func UpdateConfig(ctx context.Context, bgpServer *server.BgpServer, c, newConfig *oc.BgpConfigSet) (*oc.BgpConfigSet, error) {
 	addedPg, deletedPg, updatedPg := oc.UpdatePeerGroupConfig(bgpServer.Log(), c, newConfig)
 	added, deleted, updated := oc.UpdateNeighborConfig(bgpServer.Log(), c, newConfig)
-	addedKeychains, deletedKeychains, upsertKeyUpdates, deleteKeyUpdates, err := tcpAoKeychainConfigChanges(c.Keychains, newConfig.Keychains)
+	addedDn, deletedDn := oc.UpdateDynamicNeighborConfig(c, newConfig)
+	addedKeychains, removedKeychains, upsertKeyUpdates, deleteKeyUpdates, err := tcpAoKeychainConfigChanges(c.Keychains, newConfig.Keychains)
 	if err != nil {
 		return c, err
 	}
-	updatePolicy := oc.CheckPolicyDifference(bgpServer.Log(), oc.ConfigSetToRoutingPolicy(c), oc.ConfigSetToRoutingPolicy(newConfig))
 
-	if updatePolicy {
+	plan := &server.ConfigGenerationPlan{
+		AddKeychains:            addedKeychains,
+		UpsertKeychains:         upsertKeyUpdates,
+		DeleteOnlyKeychains:     deleteKeyUpdates,
+		RemoveKeychains:         removedKeychains,
+		AddPeerGroups:           addedPg,
+		UpdatePeerGroups:        updatedPg,
+		DeletePeerGroups:        deletedPg,
+		AddDynamicNeighbors:     addedDn,
+		DeleteDynamicNeighbors:  deletedDn,
+		AddNeighbors:            added,
+		UpdateNeighbors:         updated,
+		DeleteNeighbors:         deleted,
+	}
+
+	policyChanged := oc.CheckPolicyDifference(bgpServer.Log(), oc.ConfigSetToRoutingPolicy(c), oc.ConfigSetToRoutingPolicy(newConfig))
+	if policyChanged {
 		bgpServer.Log().Info("policy config is updated", slog.String("Topic", "config"))
+		// Validate the whole policy set against a throwaway policy before
+		// touching the running policy objects, so an undefined set or an
+		// unresolved condition rejects the generation up front.
 		p := oc.ConfigSetToRoutingPolicy(newConfig)
-		rp, err := table.NewAPIRoutingPolicyFromConfigStruct(p)
-		if err != nil {
-			bgpServer.Log().Error("failed to update policy config",
+		if err := table.ValidateRoutingPolicy(p); err != nil {
+			bgpServer.Log().Error("failed to validate policy config",
 				slog.String("Topic", "config"), slog.Any("Error", err))
-		} else if err := bgpServer.SetPolicies(ctx, &api.SetPoliciesRequest{
-			DefinedSets: rp.DefinedSets,
-			Policies:    rp.Policies,
-		}); err != nil {
-			bgpServer.Log().Error("failed to set policies",
-				slog.String("Topic", "config"), slog.Any("Error", err))
+			return c, fmt.Errorf("failed to update policy config: %w", err)
 		}
+		plan.Policy = p
 	}
 	// global policy update
 	if !newConfig.Global.ApplyPolicy.Config.Equal(&c.Global.ApplyPolicy.Config) {
-		_ = assignGlobalpolicy(ctx, bgpServer, &newConfig.Global.ApplyPolicy.Config, continueOnConfigError)
-		updatePolicy = true
+		globalApplyPolicy := newConfig.Global.ApplyPolicy.Config
+		plan.GlobalApplyPolicy = &globalApplyPolicy
 	}
 
-	// keychains and new keys must exist before peers can reference them
-	addTcpAoKeychains(ctx, bgpServer, addedKeychains)
-	updateTcpAoKeychains(ctx, bgpServer, upsertKeyUpdates)
+	// Reloading an identical configuration never changed the running state;
+	// keep it a no-op without advancing the generation.
+	if plan.Empty() {
+		return newConfig, nil
+	}
 
-	// peer groups must exist before peers can reference them
-	_ = addPeerGroups(ctx, bgpServer, addedPg, continueOnConfigError)
-	needsSoftResetIn := updatePeerGroups(ctx, bgpServer, updatedPg)
-	updatePolicy = updatePolicy || needsSoftResetIn
+	result, err := bgpServer.CommitConfigGeneration(ctx, plan)
+	if err != nil {
+		bgpServer.Log().Error("failed to update config, keeping the previous configuration generation",
+			slog.String("Topic", "config"), slog.Any("Error", err))
+		return c, err
+	}
 
-	_ = addDynamicNeighbors(ctx, bgpServer, newConfig.DynamicNeighbors, continueOnConfigError)
-	_ = addNeighbors(ctx, bgpServer, added, continueOnConfigError)
-	deleteNeighbors(ctx, bgpServer, deleted)
-	needsSoftResetIn = updateNeighbors(ctx, bgpServer, updated)
-	updatePolicy = updatePolicy || needsSoftResetIn
-
-	// peer groups can only be removed after peers stop referencing them
-	deletePeerGroups(ctx, bgpServer, deletedPg)
-
-	// keys and keychains can only be removed after peers stop referencing them
-	updateTcpAoKeychains(ctx, bgpServer, deleteKeyUpdates)
-	deleteTcpAoKeychains(ctx, bgpServer, deletedKeychains)
-
-	if updatePolicy {
+	if result.NeedsSoftResetIn {
 		if err := bgpServer.ResetPeer(ctx, &api.ResetPeerRequest{
 			Address:   "",
 			Direction: api.ResetPeerRequest_DIRECTION_IN,
 			Soft:      true,
 		}); err != nil {
-			bgpServer.Log().Error("failed to update policy config",
+			bgpServer.Log().Error("failed to soft reset peers after config update",
 				slog.String("Topic", "config"), slog.Any("Error", err))
 		}
 	}
@@ -550,33 +475,13 @@ func addTcpAoKeychains(ctx context.Context, bgpServer *server.BgpServer, chains 
 	}
 }
 
-func updateTcpAoKeychains(ctx context.Context, bgpServer *server.BgpServer, updates []*api.UpdateTcpAoKeychainRequest) {
-	for _, update := range updates {
-		if _, err := bgpServer.UpdateTcpAoKeychain(ctx, update); err != nil {
-			bgpServer.Log().Error("failed to update TCP-AO keychain",
-				slog.String("Topic", "config"),
-				slog.String("Key", update.Name),
-				slog.Any("Error", err),
-			)
-		}
-	}
-}
-
-func deleteTcpAoKeychains(ctx context.Context, bgpServer *server.BgpServer, chains []string) {
-	for _, name := range chains {
-		if err := bgpServer.DeleteTcpAoKeychain(ctx, &api.DeleteTcpAoKeychainRequest{Name: name}); err != nil {
-			bgpServer.Log().Error("failed to delete TCP-AO keychain",
-				slog.String("Topic", "config"),
-				slog.String("Key", name),
-				slog.Any("Error", err),
-			)
-		}
-	}
-}
-
+// tcpAoKeychainConfigChanges converts the current and desired keychains and
+// computes the delta. Removed chains are returned as the full API objects
+// (including keying material) so the server can rebuild them when a
+// transactional reload rolls back.
 func tcpAoKeychainConfigChanges(current, desired []oc.Keychain) (
 	added []*api.TcpAoKeychain,
-	deleted []string,
+	removed []*api.TcpAoKeychain,
 	upsertKeyUpdates []*api.UpdateTcpAoKeychainRequest,
 	deleteKeyUpdates []*api.UpdateTcpAoKeychainRequest,
 	err error,
@@ -614,9 +519,9 @@ func tcpAoKeychainConfigChanges(current, desired []oc.Keychain) (
 		if findAPITcpAoKeychain(desiredChains, currentChain.Name) != nil {
 			continue
 		}
-		deleted = append(deleted, currentChain.Name)
+		removed = append(removed, currentChain)
 	}
-	return added, deleted, upsertKeyUpdates, deleteKeyUpdates, nil
+	return added, removed, upsertKeyUpdates, deleteKeyUpdates, nil
 }
 
 func findAPITcpAoKeychain(chains []*api.TcpAoKeychain, name string) *api.TcpAoKeychain {

@@ -1,0 +1,11 @@
+项目：project-01 | 配置重载失败后的运行状态世代收敛 | osrg-gobgp-44babc9f-952b-4fb0-8564-c7fa4ab11d8a
+Session：375387593383274:a0612753fbd8abf6b556d33d83b18602_6ab0e17e7f3e96479320f2f5.6ab0e17e7f3e96479320f2f8.6ab0e17e7f3e96479320f2f6:TraeCode CN.3.3.100.no_sid.no_ppe.T(2026/9/21 15:49:18)
+验证摘要：代码调用图与定向无缓存测试已审计；完成度=部分完成；有效轮数=151。
+Rubric ID：1｜状态：未通过｜期望行为：策略或邻居阶段失败时，调用者收到稳定错误，运行配置继续完整可用且不暴露半应用世代。｜实际观察：回滚动作失败时仅记录日志且调用者仍返回原阶段错误，无法保证上一份运行配置已完整恢复｜直接证据：pkg/server/config_generation.go rollback helpers｜原因：回滚动作失败时仅记录日志且调用者仍返回原阶段错误，无法保证上一份运行配置已完整恢复｜影响：运行时可观察到新旧配置混合，后续重载不从完整旧世代收敛｜证据位置：pkg/server/config_generation.go rollback helpers
+Rubric ID：2｜状态：未通过｜期望行为：失败重载创建或修改的策略、邻居、动态邻居和认证辅助状态会被撤回或隔离，后续路由计算不读取它们。｜实际观察：策略、邻居、动态邻居与密钥回滚失败都被吞掉，失败世代对象会留在运行索引或会话中｜直接证据：pkg/server/config_generation.go rollback helpers｜原因：策略、邻居、动态邻居与密钥回滚失败都被吞掉，失败世代对象会留在运行索引或会话中｜影响：运行时可观察到新旧配置混合，后续重载不从完整旧世代收敛｜证据位置：pkg/server/config_generation.go rollback helpers
+Rubric ID：3｜状态：未通过｜期望行为：修正配置再次重载会从上一份可运行配置重算，失败尝试遗留的索引、会话和密钥不会阻止收敛。｜实际观察：上一次失败的回滚无法完成时依然返回原错误，后续重载会从带有遗留对象的运行状态开始｜直接证据：pkg/server/config_generation.go rollback orchestration｜原因：上一次失败的回滚无法完成时依然返回原错误，后续重载会从带有遗留对象的运行状态开始｜影响：运行时可观察到新旧配置混合，后续重载不从完整旧世代收敛｜证据位置：pkg/server/config_generation.go rollback orchestration
+Rubric ID：4｜状态：通过｜期望行为：成功提交后，策略匹配、对等体状态、动态邻居发现、认证资源和管理查询共同显示同一配置世代。｜实际观察：生产调用路径实现该项要求且定向验证通过｜直接证据：pkg/server/config_generation.go 与既有启动/管理路径的定向 Go 测试
+Rubric ID：5｜状态：未通过｜期望行为：外部会话或认证资源在重载中失败时都有明确 owner 和终态，不留下仍运行但不属于有效配置的后台资源。｜实际观察：外部会话和认证资源的撤销错误没有返回主流程，函数返回时失败世代资源仍可运行｜直接证据：pkg/server/config_generation.go peer/keychain rollback｜原因：外部会话和认证资源的撤销错误没有返回主流程，函数返回时失败世代资源仍可运行｜影响：运行时可观察到新旧配置混合，后续重载不从完整旧世代收敛｜证据位置：pkg/server/config_generation.go peer/keychain rollback
+Rubric ID：6｜状态：未通过｜期望行为：连续失败、成功、失败的重载不会让较旧结果覆盖较新世代，进程仍可接受后续更新。｜实际观察：失败世代的回滚结果未纳入可检查的提交屏障，连续重载无法阻止遗留状态参与后续更新｜直接证据：pkg/server/config_generation.go generation rollback｜原因：失败世代的回滚结果未纳入可检查的提交屏障，连续重载无法阻止遗留状态参与后续更新｜影响：运行时可观察到新旧配置混合，后续重载不从完整旧世代收敛｜证据位置：pkg/server/config_generation.go generation rollback
+Rubric ID：7｜状态：通过｜期望行为：无错误时，启动配置、增量更新、BGP 会话建立和既有管理查询结果保持兼容。｜实际观察：生产调用路径实现该项要求且定向验证通过｜直接证据：pkg/server/config_generation.go 与既有启动/管理路径的定向 Go 测试
+Rubric ID：8｜状态：通过｜期望行为：与配置对象无关的重载错误继续按原有非致命进程存活语义返回。｜实际观察：生产调用路径实现该项要求且定向验证通过｜直接证据：pkg/server/config_generation.go 与既有启动/管理路径的定向 Go 测试
