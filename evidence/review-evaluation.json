@@ -1,0 +1,48 @@
+{
+  "id": "osrg-gobgp-2c5fffab-4a2e-4cf1-9434-a3c2b2aecbac",
+  "expectedSyncRevision": 4,
+  "completionStatus": "部分完成",
+  "rubricResults": [
+    {
+      "id": 1,
+      "passed": false,
+      "reason": "ZAPI sendOrError 只把消息放入 outgoing 通道就报告成功，AddVrf 不等待序列化、socket 写入或 Zebra 确认"
+    },
+    {
+      "id": 2,
+      "passed": false,
+      "reason": "创建失败回滚依赖只保证入队的 ZAPI 撤销，API 返回时 Zebra 外部状态未确认撤销"
+    },
+    {
+      "id": 3,
+      "passed": true,
+      "reason": ""
+    },
+    {
+      "id": 4,
+      "passed": true,
+      "reason": ""
+    },
+    {
+      "id": 5,
+      "passed": false,
+      "reason": "DeleteVrf 先删除 VRF 并传播撤回，随后 label 发送失败会留下已改变查询和 watcher 但 Zebra 仍保留 label 的状态"
+    },
+    {
+      "id": 6,
+      "passed": true,
+      "reason": ""
+    },
+    {
+      "id": 7,
+      "passed": false,
+      "reason": "DeleteVrf 的本地查询和 watcher 在 Zebra label 撤回成功前已更新，失败返回后三个观察面不一致"
+    },
+    {
+      "id": 8,
+      "passed": true,
+      "reason": ""
+    }
+  ],
+  "runResult": "1 未通过 ZAPI sendOrError 只把消息放入 outgoing 通道就报告成功，AddVrf 不等待序列化、socket 写入或 Zebra 确认\n2 未通过 创建失败回滚依赖只保证入队的 ZAPI 撤销，API 返回时 Zebra 外部状态未确认撤销\n3 通过\n4 通过\n5 未通过 DeleteVrf 先删除 VRF 并传播撤回，随后 label 发送失败会留下已改变查询和 watcher 但 Zebra 仍保留 label 的状态\n6 通过\n7 未通过 DeleteVrf 的本地查询和 watcher 在 Zebra label 撤回成功前已更新，失败返回后三个观察面不一致\n8 通过"
+}

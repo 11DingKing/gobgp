@@ -26,6 +26,12 @@ type Vrf struct {
 	ImportRt  routeTargetMap
 	ExportRt  []bgp.ExtendedCommunityInterface
 	MplsLabel uint32
+	// Generation identifies this particular VRF instance. It gets a new
+	// value every time a VRF is created, so asynchronous callbacks (late
+	// label-chunk processing, label withdrawals) can tell a live instance
+	// apart from an earlier one that used the same name or vrf ID and
+	// refuse to act on the replaced instance.
+	Generation uint64
 }
 
 func (v *Vrf) Clone() *Vrf {
@@ -34,12 +40,13 @@ func (v *Vrf) Clone() *Vrf {
 		return append(l, rt...)
 	}
 	return &Vrf{
-		Name:      v.Name,
-		Id:        v.Id,
-		Rd:        v.Rd,
-		ImportRt:  v.ImportRt.Clone(),
-		ExportRt:  f(v.ExportRt),
-		MplsLabel: v.MplsLabel,
+		Name:       v.Name,
+		Id:         v.Id,
+		Rd:         v.Rd,
+		ImportRt:   v.ImportRt.Clone(),
+		ExportRt:   f(v.ExportRt),
+		MplsLabel:  v.MplsLabel,
+		Generation: v.Generation,
 	}
 }
 

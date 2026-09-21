@@ -153,6 +153,7 @@ type TableManager struct {
 	mu             sync.RWMutex // protects tables and vrfs maps
 	tables         map[bgp.Family]*Table
 	vrfs           map[string]*Vrf
+	nextVrfGeneration uint64 // monotonically increasing VRF instance generation
 	rfList         []bgp.Family
 	maxPathCounted atomic.Uint64
 	logger         *slog.Logger
@@ -222,19 +223,23 @@ func (manager *TableManager) AddVrf(name string, id uint32, rd bgp.RouteDistingu
 	if err != nil {
 		return nil, err
 	}
+	manager.nextVrfGeneration++
+	generation := manager.nextVrfGeneration
 	manager.logger.Debug("add vrf",
 		slog.String("Topic", "Vrf"),
 		slog.String("Key", name),
 		slog.String("Rd", rd.String()),
 		slog.Any("ImportRt", rtMap.ToSlice()),
 		slog.Any("ExportRt", exportRt),
+		slog.Any("Generation", generation),
 	)
 	manager.vrfs[name] = &Vrf{
-		Name:     name,
-		Id:       id,
-		Rd:       rd,
-		ImportRt: rtMap,
-		ExportRt: exportRt,
+		Name:       name,
+		Id:         id,
+		Rd:         rd,
+		ImportRt:   rtMap,
+		ExportRt:   exportRt,
+		Generation: generation,
 	}
 	msgs := make([]*Path, 0, len(importRt))
 	nexthop := netip.IPv4Unspecified()
@@ -552,6 +557,36 @@ func (manager *TableManager) GetVrf(name string) (*Vrf, bool) {
 	defer manager.mu.RUnlock()
 	vrf, ok := manager.vrfs[name]
 	return vrf, ok
+}
+
+// GetVrfById returns the first VRF configured with the given vrf ID.
+// Thread-safe: uses RLock internally.
+func (manager *TableManager) GetVrfById(id uint32) (*Vrf, bool) {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	for _, vrf := range manager.vrfs {
+		if vrf.Id == id {
+			return vrf, true
+		}
+	}
+	return nil, false
+}
+
+// SetVrfMplsLabel records the assigned MPLS label on the named VRF.
+// It must be called only after the label bitmap entry has been reserved and
+// the label has been (or is about to be) published to Zebra, so the stored
+// label always corresponds to this live VRF instance. Returns false when the
+// named VRF no longer exists.
+// Thread-safe: uses Lock internally.
+func (manager *TableManager) SetVrfMplsLabel(name string, label uint32) bool {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	vrf, ok := manager.vrfs[name]
+	if !ok {
+		return false
+	}
+	vrf.MplsLabel = label
+	return true
 }
 
 // GetAllVrfs returns a copy of all VRF names.

@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "AddVrf 仅在 VRF、route-target 派生路由、label 占用和 Zebra 发布均完成后报告成功并可被查询。"
+  - id: 2
+    type: f2p
+    text: "创建期间 label 申请或 Zebra 发布失败会撤销本次 VRF 和已传播路由，并归还已占用 label 以供后续创建使用。"
+  - id: 3
+    type: f2p
+    text: "同一创建请求重试不会重复传播 RTC 或 VPN 路由，也不会为同一 VRF 泄漏或分配多个 label。"
+  - id: 4
+    type: f2p
+    text: "DeleteVrf 在邻居占用检查或 RIB 删除失败时保留仍被该 VRF 使用的 label 与 Zebra 状态。"
+  - id: 5
+    type: f2p
+    text: "删除成功会撤回派生路由和外部 label 后再释放本地位图，任一步失败都返回可重试且不会把已用 label 分给其他 VRF。"
+  - id: 6
+    type: f2p
+    text: "并发同名创建删除及迟到 label-chunk 响应按 VRF 实例隔离，不会修改已删除或替换实例。"
+  - id: 7
+    type: f2p
+    text: "API 查询、VPN/RTC watcher 与 Zebra 对成功或回滚后的 VRF、路由和 label 观察一致。"
+  - id: 8
+    type: p2p
+    text: "未配置 label range 的 VRF、普通成功创建删除和邻居仍占用时的既有拒绝行为保持兼容。"

@@ -347,10 +347,27 @@ func newPathFromIPRouteMessage(logger *slog.Logger, m *zebra.Message, version ui
 	return path
 }
 
+// mplsLabelNone is the label value FRR treats as "no label". Sending
+// ZEBRA_VRF_LABEL with this value makes Zebra uninstall the VRF's label
+// (Ref: MPLS_LABEL_NONE in lib/mpls.h of FRR and zread_vrf_label in
+// zebra/zapi_msg.c).
+const mplsLabelNone uint32 = 0xffffffff
+
+// pendingLabelRelease records a VRF label whose owning VRF has already been
+// removed from the RIB but whose withdrawal from Zebra could not be confirmed.
+// The bitmap entry stays flagged (so the label cannot be reused) until the
+// withdrawal succeeds on a later retry.
+type pendingLabelRelease struct {
+	name       string
+	label      uint32
+	vrfId      uint32
+	generation uint64 // generation of the deleted VRF instance
+}
+
 type mplsLabelParameter struct {
-	rangeSize     uint32
-	maps          map[uint64]*table.Bitmap
-	unassignedVrf []*table.Vrf // Vrfs which are not assigned MPLS label
+	rangeSize      uint32
+	maps           map[uint64]*table.Bitmap
+	pendingRelease []*pendingLabelRelease
 }
 
 type zebraClient struct {
@@ -465,22 +482,24 @@ func (z *zebraClient) loop() {
 				}
 				z.updatePathByNexthopCache(paths)
 			case *zebra.GetLabelChunkBody:
+				chunk := body
 				z.server.logger.Debug("zebra GetLabelChunkBody is received",
 					slog.String("Topic", "Zebra"),
-					slog.Int("Start", int(body.Start)),
-					slog.Int("End", int(body.End)),
+					slog.Int("Start", int(chunk.Start)),
+					slog.Int("End", int(chunk.End)),
 				)
-				startEnd := uint64(body.Start)<<32 | uint64(body.End)
-				z.mplsLabel.maps[startEnd] = table.NewBitmap(int(body.End - body.Start + 1))
-				for _, vrf := range z.mplsLabel.unassignedVrf {
-					if err := z.assignAndSendVrfMplsLabel(vrf); err != nil {
-						z.server.logger.Error("zebra failed to assign and send vrf mpls label",
-							slog.String("Topic", "Zebra"),
-							slog.String("Vrf", vrf.Name),
-							slog.String("Error", err.Error()))
-					}
+				// Register the chunk and retry pending withdrawals inside a
+				// serialized management operation, so the response can never
+				// race an AddVrf/DeleteVrf or touch a replaced VRF instance.
+				err := z.server.mgmtOperation(func() error {
+					z.registerLabelChunk(chunk)
+					return nil
+				}, true)
+				if err != nil {
+					z.server.logger.Warn("failed to register label chunk",
+						slog.String("Topic", "Zebra"),
+						slog.String("Error", err.Error()))
 				}
-				z.mplsLabel.unassignedVrf = nil
 			}
 		case ev := <-w.Event():
 			switch msg := ev.(type) {
@@ -646,10 +665,12 @@ func newZebraClient(s *BgpServer, url string, protos []string, version uint8, nh
 	return w, nil
 }
 
-func (z *zebraClient) assignMplsLabel() (uint32, error) {
-	if z.mplsLabel.maps == nil {
-		return 0, nil
-	}
+// allocateMplsLabel reserves a free label bit from the registered label
+// chunks. It only touches the local bitmap; the caller is responsible for
+// publishing the label to Zebra and committing it to the VRF afterwards.
+// Returns an error when no label chunk has been registered yet or all labels
+// in the registered chunks are in use.
+func (z *zebraClient) allocateMplsLabel() (uint32, error) {
 	var label uint32
 	for startEnd, bitmap := range z.mplsLabel.maps {
 		start := uint32(startEnd >> 32)
@@ -666,16 +687,101 @@ func (z *zebraClient) assignMplsLabel() (uint32, error) {
 	return label, nil
 }
 
-func (z *zebraClient) assignAndSendVrfMplsLabel(vrf *table.Vrf) error {
-	var err error
-	if vrf.MplsLabel, err = z.assignMplsLabel(); vrf.MplsLabel > 0 { // success
-		if err = z.client.SendVrfLabel(vrf.MplsLabel, vrf.Id); err != nil {
-			return err
-		}
-	} else if vrf.MplsLabel == 0 { // GetLabelChunk is not performed
-		z.mplsLabel.unassignedVrf = append(z.mplsLabel.unassignedVrf, vrf)
+// sendVrfMplsLabel publishes the VRF label to Zebra (ZEBRA_VRF_LABEL).
+func (z *zebraClient) sendVrfMplsLabel(label, vrfId uint32) error {
+	return z.client.SendVrfLabel(label, vrfId)
+}
+
+// registerLabelChunk records a label chunk returned by Zebra. A late or
+// duplicate response for an already registered range is ignored, otherwise
+// its bitmap would be reset and labels already published to Zebra could be
+// allocated a second time. Pending label withdrawals are retried, since
+// receiving this response proves the Zebra session is alive.
+// Must be called from a serialized management operation.
+func (z *zebraClient) registerLabelChunk(body *zebra.GetLabelChunkBody) {
+	startEnd := uint64(body.Start)<<32 | uint64(body.End)
+	if _, ok := z.mplsLabel.maps[startEnd]; ok {
+		z.server.logger.Debug("label chunk already registered, ignore duplicate response",
+			slog.String("Topic", "Zebra"),
+			slog.Int("Start", int(body.Start)),
+			slog.Int("End", int(body.End)),
+		)
+	} else {
+		z.mplsLabel.maps[startEnd] = table.NewBitmap(int(body.End - body.Start + 1))
 	}
-	return err
+	z.sweepPendingLabelReleases()
+}
+
+// withdrawVrfMplsLabel asks Zebra to uninstall the VRF label and, once the
+// message is accepted, releases the local bitmap entry. If the message cannot
+// be sent, the bitmap entry stays flagged and is recorded as pending release
+// so the label is neither reused while Zebra still holds it nor lost.
+// Must be called from a serialized management operation.
+func (z *zebraClient) withdrawVrfMplsLabel(name string, label, vrfId uint32, generation uint64) error {
+	if err := z.client.SendVrfLabel(mplsLabelNone, vrfId); err != nil {
+		z.addPendingLabelRelease(name, label, vrfId, generation)
+		return err
+	}
+	z.releaseMplsLabel(label)
+	return nil
+}
+
+func (z *zebraClient) addPendingLabelRelease(name string, label, vrfId uint32, generation uint64) {
+	for _, p := range z.mplsLabel.pendingRelease {
+		if p.label == label {
+			// The bitmap entry is already retained for this label.
+			return
+		}
+	}
+	z.mplsLabel.pendingRelease = append(z.mplsLabel.pendingRelease, &pendingLabelRelease{
+		name:       name,
+		label:      label,
+		vrfId:      vrfId,
+		generation: generation,
+	})
+}
+
+// sweepPendingLabelReleases retries label withdrawals left pending by failed
+// VRF deletions. If the vrf ID is now used by another VRF instance, that
+// VRF's own ZEBRA_VRF_LABEL publish has already made Zebra uninstall the
+// stale label (Ref: zread_vrf_label), so only the local bitmap entry still
+// needs to be released.
+// Must be called from a serialized management operation.
+func (z *zebraClient) sweepPendingLabelReleases() {
+	if len(z.mplsLabel.pendingRelease) == 0 {
+		return
+	}
+	kept := make([]*pendingLabelRelease, 0, len(z.mplsLabel.pendingRelease))
+	for _, p := range z.mplsLabel.pendingRelease {
+		if current, ok := z.server.globalRib.GetVrfById(p.vrfId); ok {
+			if current.Generation != p.generation {
+				// Replacement VRF instance: never withdraw its label, and
+				// Zebra has already uninstalled the old one.
+				z.releaseMplsLabel(p.label)
+				continue
+			}
+			// A live VRF of the same generation (unexpected): leave it alone.
+			kept = append(kept, p)
+			continue
+		}
+		if err := z.client.SendVrfLabel(mplsLabelNone, p.vrfId); err != nil {
+			kept = append(kept, p)
+			continue
+		}
+		z.releaseMplsLabel(p.label)
+	}
+	z.mplsLabel.pendingRelease = kept
+}
+
+// pendingHasName reports whether a label belonging to a VRF of the given name
+// is still awaiting withdrawal from Zebra.
+func (z *zebraClient) pendingHasName(name string) bool {
+	for _, p := range z.mplsLabel.pendingRelease {
+		if p.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (z *zebraClient) releaseMplsLabel(label uint32) {

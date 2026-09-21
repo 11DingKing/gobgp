@@ -1556,6 +1556,40 @@ func (c *Client) sendCommand(command APIType, vrfID uint32, body Body) {
 	c.send(m)
 }
 
+// sendOrError delivers m like send does, but returns an error instead of
+// silently dropping the message. Once the connection breaks, the outgoing
+// channel is closed and sends panic; callers that must keep local resources
+// (e.g. VRF label bitmaps) aligned with Zebra need that failure surfaced so
+// they can retain the resources and return a retryable error.
+func (c *Client) sendOrError(m *Message) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("the Zebra connection is closed: %v", r)
+		}
+	}()
+	c.logger.Debug("send command to zebra",
+		slog.String("Topic", "Zebra"),
+		slog.Any("Header", m.Header),
+		slog.Any("Body", m.Body))
+	c.outgoing <- m
+	return nil
+}
+
+// sendCommandOrError serializes and delivers the command through sendOrError.
+func (c *Client) sendCommandOrError(command APIType, vrfID uint32, body Body) error {
+	m := &Message{
+		Header: Header{
+			Len:     HeaderSize(c.Version),
+			Marker:  HeaderMarker(c.Version),
+			Version: c.Version,
+			VrfID:   vrfID,
+			Command: command.ToEach(c.Version, c.Software),
+		},
+		Body: body,
+	}
+	return c.sendOrError(m)
+}
+
 // SendHello sends HELLO message to zebra daemon.
 func (c *Client) SendHello() {
 	if c.redistDefault > 0 {
@@ -1696,8 +1730,7 @@ func (c *Client) SendVrfLabel(label uint32, vrfID uint32) error {
 		afi:       afiIP,
 		labelType: lspBGP,
 	}
-	c.sendCommand(vrfLabel, vrfID, body)
-	return nil
+	return c.sendCommandOrError(vrfLabel, vrfID, body)
 }
 
 // for avoiding double close

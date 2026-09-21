@@ -2782,6 +2782,25 @@ func (s *BgpServer) ListVrf(ctx context.Context, r *api.ListVrfRequest, fn func(
 	return nil
 }
 
+// rollbackVrfCreate undoes an AddVrf that failed after the VRF was inserted
+// into the RIB. It removes the VRF and withdraws every route of its that was
+// already propagated, so a later retry starts from a clean state and neither
+// re-propagates routes nor leaks labels. Must be called from a serialized
+// management operation.
+func (s *BgpServer) rollbackVrfCreate(name string) {
+	pathList, err := s.globalRib.DeleteVrf(name)
+	if err != nil {
+		s.logger.Error("failed to roll back VRF creation",
+			slog.String("Topic", "Vrf"),
+			slog.String("Key", name),
+			slog.String("Error", err.Error()))
+		return
+	}
+	if len(pathList) > 0 {
+		s.propagateUpdate(nil, pathList)
+	}
+}
+
 func (s *BgpServer) AddVrf(ctx context.Context, r *api.AddVrfRequest) error {
 	if r == nil || r.Vrf == nil {
 		return fmt.Errorf("nil request")
@@ -2808,17 +2827,53 @@ func (s *BgpServer) AddVrf(ctx context.Context, r *api.AddVrfRequest) error {
 			LocalID: s.bgpConfig.Global.Config.RouterId,
 		}
 
-		if pathList, err := s.globalRib.AddVrf(name, id, rd, im, ex, pi); err != nil {
+		// Step 1: create the VRF instance and derive its RTC routes.
+		rtcPathList, err := s.globalRib.AddVrf(name, id, rd, im, ex, pi)
+		if err != nil {
 			return err
-		} else if len(pathList) > 0 {
-			s.propagateUpdate(nil, pathList)
 		}
-		if vrf, ok := s.globalRib.GetVrf(name); ok {
-			if s.zclient != nil && s.zclient.mplsLabel.rangeSize > 0 {
-				if err := s.zclient.assignAndSendVrfMplsLabel(vrf); err != nil {
-					return fmt.Errorf("failed to assign MPLS label for VRF %s: %w", name, err)
-				}
+
+		// Step 2: reserve the MPLS label bitmap entry. Nothing has been
+		// published yet, so a failure here only needs the RIB change undone.
+		var label uint32
+		if s.zclient != nil && s.zclient.mplsLabel.rangeSize > 0 {
+			label, err = s.zclient.allocateMplsLabel()
+			if err != nil {
+				s.rollbackVrfCreate(name)
+				return fmt.Errorf("failed to assign MPLS label for VRF %s: %w", name, err)
 			}
+		}
+
+		// Step 3: publish the label to Zebra before it is committed to the
+		// VRF. If Zebra cannot accept it, release the reserved bit and undo
+		// the creation: VRF, bitmap and Zebra must never disagree.
+		if label > 0 {
+			if err = s.zclient.sendVrfMplsLabel(label, id); err != nil {
+				s.zclient.releaseMplsLabel(label)
+				s.rollbackVrfCreate(name)
+				return fmt.Errorf("failed to send MPLS label %d for VRF %s to Zebra: %w", label, name, err)
+			}
+			if !s.globalRib.SetVrfMplsLabel(name, label) {
+				// The VRF cannot disappear within this same serialized
+				// operation; handle it defensively by withdrawing the label
+				// just published and removing the partial VRF.
+				if werr := s.zclient.withdrawVrfMplsLabel(name, label, id, 0); werr != nil {
+					s.logger.Error("failed to withdraw MPLS label after losing VRF",
+						slog.String("Topic", "Vrf"),
+						slog.String("Key", name),
+						slog.Uint64("Label", uint64(label)),
+						slog.String("Error", werr.Error()))
+				}
+				s.rollbackVrfCreate(name)
+				return fmt.Errorf("failed to commit MPLS label %d to VRF %s: VRF no longer exists", label, name)
+			}
+		}
+
+		// Step 4: propagate the derived RTC routes last, once the VRF and
+		// (when used) its label are committed, so a failed creation never
+		// leaves routes advertised for a non-existent VRF.
+		if len(rtcPathList) > 0 {
+			s.propagateUpdate(nil, rtcPathList)
 		}
 		return nil
 	}, true)
@@ -2830,6 +2885,8 @@ func (s *BgpServer) DeleteVrf(ctx context.Context, r *api.DeleteVrfRequest) erro
 	}
 	return s.mgmtOperation(func() error {
 		name := r.Name
+
+		// Step 1: reject the deletion while a neighbor still occupies the VRF.
 		for _, n := range s.neighborMap {
 			conf := n.fsm.pConf.ReadOnly()
 			peerVrf := conf.Config.Vrf
@@ -2838,17 +2895,53 @@ func (s *BgpServer) DeleteVrf(ctx context.Context, r *api.DeleteVrfRequest) erro
 			}
 		}
 
-		if vrf, ok := s.globalRib.GetVrf(name); ok {
-			if vrf.MplsLabel > 0 {
-				s.zclient.releaseMplsLabel(vrf.MplsLabel)
+		vrf, ok := s.globalRib.GetVrf(name)
+		if !ok {
+			// The VRF itself is gone. An earlier delete may have removed it
+			// but left its label pending withdrawal from Zebra; finish that
+			// work on behalf of the retry instead of reporting not-found.
+			if s.zclient != nil {
+				hadPending := s.zclient.pendingHasName(name)
+				s.zclient.sweepPendingLabelReleases()
+				if hadPending && !s.zclient.pendingHasName(name) {
+					return nil
+				}
 			}
+			return fmt.Errorf("vrf %s not found", name)
 		}
+
+		label := vrf.MplsLabel
+		generation := vrf.Generation
+
+		// Step 2: a labeled VRF needs Zebra to withdraw the external label.
+		// If Zebra is not enabled, keep the VRF and all its resources and
+		// let the caller retry later.
+		if label > 0 && s.zclient == nil {
+			return fmt.Errorf("cannot delete VRF %s while it holds MPLS label %d: Zebra is not enabled", name, label)
+		}
+
+		// Step 3: perform the RIB deletion. On failure the VRF and every
+		// resource it uses stay untouched.
 		pathList, err := s.globalRib.DeleteVrf(name)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to delete VRF %s: %w", name, err)
 		}
+
+		// Step 4: withdraw the VRF's VPN/RTC routes (RTC routes are only
+		// withdrawn when no remaining VRF imports the same RT).
 		if len(pathList) > 0 {
 			s.propagateUpdate(nil, pathList)
+		}
+
+		// Step 5: only after the RIB deletion is confirmed, withdraw the
+		// external label and release the bitmap entry. If the withdrawal
+		// cannot be sent, the label stays occupied (and is retried on a
+		// later chunk response or DeleteVrf retry) rather than being
+		// recycled while Zebra still holds it.
+		if label > 0 {
+			if err := s.zclient.withdrawVrfMplsLabel(name, label, vrf.Id, generation); err != nil {
+				return fmt.Errorf("failed to withdraw MPLS label %d for deleted VRF %s (resources retained, retry the deletion): %w", label, name, err)
+			}
 		}
 		return nil
 	}, true)
