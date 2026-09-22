@@ -21,17 +21,17 @@
     {
       "id": 4,
       "passed": false,
-      "reason": "RIB 重放中 SendIPRoute 错误只记录日志，prepareSession 仍把 FIB 类别标记为已同步"
+      "reason": "当前路由表重放发送失败后只记录日志，会话准备流程仍把转发表路由类别标记为已同步"
     },
     {
       "id": 5,
       "passed": false,
-      "reason": "nexthop 重放中 SendNexthopRegister 错误只记录日志，prepareSession 仍把 nexthop 类别标记为已同步"
+      "reason": "下一跳注册重放失败后只记录日志，会话准备流程仍把下一跳类别标记为已同步"
     },
     {
       "id": 6,
       "passed": false,
-      "reason": "初始 MPLS label chunk 请求失败后只记录错误，当前已连接会话不会重试且一直保持未同步"
+      "reason": "初始标签块请求失败后只记录错误，当前已连接会话不再重试且一直保持标签类别未同步"
     },
     {
       "id": 7,
@@ -44,5 +44,5 @@
       "reason": ""
     }
   ],
-  "runResult": "1 通过\n2 通过\n3 通过\n4 未通过 RIB 重放中 SendIPRoute 错误只记录日志，prepareSession 仍把 FIB 类别标记为已同步\n5 未通过 nexthop 重放中 SendNexthopRegister 错误只记录日志，prepareSession 仍把 nexthop 类别标记为已同步\n6 未通过 初始 MPLS label chunk 请求失败后只记录错误，当前已连接会话不会重试且一直保持未同步\n7 通过\n8 通过"
+  "runResult": "1 通过\n2 通过\n3 通过\n4 未通过 当前路由表重放发送失败后只记录日志，会话准备流程仍把转发表路由类别标记为已同步\n5 未通过 下一跳注册重放失败后只记录日志，会话准备流程仍把下一跳类别标记为已同步\n6 未通过 初始标签块请求失败后只记录错误，当前已连接会话不再重试且一直保持标签类别未同步\n7 通过\n8 通过"
 }
